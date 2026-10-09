@@ -164,6 +164,9 @@ static NSString *const DYLogDidUpdateNotification = @"DYLogDidUpdateNotification
 // ----------------------------------------------------------------------------
 static BOOL gBypassEnabled = YES;
 
+// 全局总开关：关闭后所有日志不捕获、不显示，但 hook 仍在运行
+static BOOL gGlobalLogEnabled = YES;
+
 @interface DYLogManager : NSObject
 + (instancetype)sharedManager;
 // 追加一条日志（category：分类，如 "弹窗" / "文件IO"；message：详细内容）
@@ -204,6 +207,7 @@ static BOOL gBypassEnabled = YES;
 
 - (void)logWithCategory:(NSString *)category message:(NSString *)message {
     if (!message) return;
+    if (!gGlobalLogEnabled) return; // 全局总开关关了，所有日志不捕获不显示
     // 防止单条日志过长（比如大 SQL 或密文 hex 几百行）
     NSString *trimmed = message.length > 5000 ? [[message substringToIndex:5000] stringByAppendingFormat:@"...(truncated from %lu chars)", (unsigned long)message.length] : message;
     NSString *line = [NSString stringWithFormat:@"[%@] [%@] %@",
@@ -1941,7 +1945,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
-        case 0: return 3; // 拦截抓包 / 加密捕获 / 只看加密
+        case 0: return 4; // 全局总开关 / 拦截抓包 / 加密捕获 / 只看加密
         case 1: return 2; // Keychain / UserDefaults
         case 2: return 1; // 关于应用
         case 3: return 1; // 自定义 Hook 入口
@@ -2004,10 +2008,14 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     NSInteger r = indexPath.row;
     if (s == 0) {
         if (r == 0) {
+            cell.textLabel.text = @"全局总开关（日志捕获/显示）";
+            sw.on = gGlobalLogEnabled;
+            [sw addTarget:self action:@selector(toggleGlobalLog:) forControlEvents:UIControlEventValueChanged];
+        } else if (r == 1) {
             cell.textLabel.text = @"拦截应用检测抓包";
             sw.on = gBypassEnabled;
             [sw addTarget:self action:@selector(toggleBypass:) forControlEvents:UIControlEventValueChanged];
-        } else if (r == 1) {
+        } else if (r == 2) {
             cell.textLabel.text = @"捕获加密/哈希 密钥与明文";
             sw.on = gDecryptMonitorEnabled;
             [sw addTarget:self action:@selector(toggleDecrypt:) forControlEvents:UIControlEventValueChanged];
@@ -2030,6 +2038,12 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     return cell;
 }
 
+- (void)toggleGlobalLog:(UISwitch *)sw {
+    gGlobalLogEnabled = sw.isOn;
+    // 开关日志本身不能用 logWithCategory 写（全局关了就不写）
+    // 用 NSLog 保证系统控制台能看到
+    NSLog(@"[应用助手] 全局总开关（日志捕获/显示）已%@", sw.isOn ? @"开启" : @"关闭");
+}
 - (void)toggleBypass:(UISwitch *)sw {
     gBypassEnabled = sw.isOn;
     [[DYLogManager sharedManager] logWithCategory:@"系统"
