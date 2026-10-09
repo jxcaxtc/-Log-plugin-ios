@@ -28,6 +28,11 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
           ls "$THEOS/sdks"
 
+      - name: Install ldid
+        run: |
+          # Theos 在链接后需要 ldid 对 dylib 签名
+          brew install theosos/tap/ldid || brew install ldid
+
       - name: Build dylib
         run: |
           export THEOS="$HOME/theos"
