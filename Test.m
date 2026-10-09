@@ -71,6 +71,10 @@ static BOOL gDecryptMonitorEnabled = YES;
 // 全局开关：UI 日志过滤（YES 时面板只显示 category=="加密" 的密钥/明文类日志；NO 时显示全部）
 static BOOL gLogFilterKeyOnly = NO;
 
+// 搜索过滤：支持正则，nil / @"" 表示不过滤
+static NSString *gSearchPattern = nil;
+static BOOL gSearchIsRegex = NO;  // NO = 子串匹配，YES = 正则
+
 // 获取当前时间戳字符串，格式：yyyy-MM-dd HH:mm:ss.SSS
 static NSString *DYTimestampString(void) {
     static NSDateFormatter *formatter = nil;
@@ -1187,7 +1191,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 @end
 
 // ----------------------------------------------------------------------------
-@interface DYFloatingPanel : UIView <UITextViewDelegate, UIDocumentPickerDelegate, UIGestureRecognizerDelegate>
+@interface DYFloatingPanel : UIView <UITextViewDelegate, UIDocumentPickerDelegate, UIGestureRecognizerDelegate, UISearchBarDelegate>
 @property (nonatomic, strong) UITextView *logTextView;
 @property (nonatomic, strong) UIButton *saveButton;
 @property (nonatomic, strong) UIButton *clearButton;
@@ -1306,7 +1310,15 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     [self.closeButton addTarget:self action:@selector(handleClose) forControlEvents:UIControlEventTouchUpInside];
     [titleBar addSubview:self.closeButton];
 
-    // 三个开关横向并排：每个都是 switch 在上、小字号 label 在下，整体缩小 0.85x
+    // 搜索框（titleBar 下方）
+    UISearchBar *searchBar = [[UISearchBar alloc] init];
+    searchBar.delegate = self;
+    searchBar.placeholder = @"搜索日志（regex:... 用正则）";
+    searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    searchBar.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:searchBar];
+
+    // 三个开关横向并排（放到 logTextView 之后创建）
     UIStackView *switchStack = [[UIStackView alloc] init];
     switchStack.axis = UILayoutConstraintAxisHorizontal;
     switchStack.distribution = UIStackViewDistributionFillEqually;
@@ -1401,16 +1413,21 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [self.closeButton.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
         [self.closeButton.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
 
-        // switchStack（三个开关横排，缩小 0.85x）
-        [switchStack.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:4],
+        // searchBar
+        [searchBar.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:2],
+        [searchBar.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
+        [searchBar.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
+
+        // logTextView
+        [self.logTextView.topAnchor constraintEqualToAnchor:searchBar.bottomAnchor constant:4],
+        [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+        [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+
+        // switchStack（三个开关横排，logTextView 下方）
+        [switchStack.topAnchor constraintEqualToAnchor:self.logTextView.bottomAnchor constant:6],
         [switchStack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
         [switchStack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
         [switchStack.heightAnchor constraintEqualToConstant:40],
-
-        // logTextView
-        [self.logTextView.topAnchor constraintEqualToAnchor:switchStack.bottomAnchor constant:8],
-        [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
-        [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
 
         // saveButton / clearButton
         [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:24],
@@ -1422,9 +1439,11 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [self.clearButton.heightAnchor constraintEqualToConstant:44],
         [self.clearButton.widthAnchor constraintEqualToAnchor:self.saveButton.widthAnchor],
 
-        // logTextView 底部到底部按钮上方，最大高度 150pt
-        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
-        [self.logTextView.heightAnchor constraintLessThanOrEqualToConstant:150],
+        // switchStack 底部在 saveButton 上方
+        [switchStack.bottomAnchor constraintLessThanOrEqualToAnchor:self.saveButton.topAnchor constant:-6],
+
+        // logTextView 底部在 switchStack 上方（这样 log 区会自由伸缩直到遇到 switchStack）
+        [self.logTextView.bottomAnchor constraintLessThanOrEqualToAnchor:switchStack.topAnchor constant:-6],
     ]];
 
     // 长按拖动
@@ -1441,38 +1460,66 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
                                                object:nil];
 }
 
+// ---- UISearchBar 搜索（regex:... 前缀表示正则，否则子串） ----
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    NSString *text = [searchText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (text.length > 7 && [[text lowercaseString] hasPrefix:@"regex:"]) {
+        gSearchPattern = [text substringFromIndex:6];
+        gSearchIsRegex = YES;
+    } else if (text.length > 0) {
+        gSearchPattern = text;
+        gSearchIsRegex = NO;
+    } else {
+        gSearchPattern = nil;
+        gSearchIsRegex = NO;
+    }
+    [self applyLogFilter];
+}
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar { [searchBar resignFirstResponder]; }
+- (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
+    searchBar.text = @""; [searchBar resignFirstResponder];
+    gSearchPattern = nil; gSearchIsRegex = NO;
+    [self applyLogFilter];
+}
+
+// 过滤判断：合并 "只看加密" + "搜索"
+static BOOL DYShouldShowLine(NSString *line) {
+    if (!line) return NO;
+    if (gLogFilterKeyOnly && [line rangeOfString:@"[加密]"].location == NSNotFound) return NO;
+    if (gSearchPattern.length > 0) {
+        if (gSearchIsRegex) {
+            NSError *err = nil;
+            NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:gSearchPattern
+                                                                                options:0 error:&err];
+            if (err || !re) return YES; // 正则非法时不过滤
+            NSTextCheckingResult *m = [re firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+            if (!m) return NO;
+        } else {
+            if ([line rangeOfString:gSearchPattern options:NSCaseInsensitiveSearch].location == NSNotFound) return NO;
+        }
+    }
+    return YES;
+}
+
 - (void)onLogUpdate:(NSNotification *)note {
     NSDictionary *userInfo = note.userInfo;
-    if ([userInfo[@"clear"] boolValue]) {
-        self.logTextView.text = @"";
-        return;
-    }
+    if ([userInfo[@"clear"] boolValue]) { self.logTextView.text = @""; return; }
     NSString *line = userInfo[@"line"];
     if (!line) return;
-
-    // 过滤：开了 "只显示密钥" 时，只把 [加密] category 显示到面板
-    if (gLogFilterKeyOnly && [line rangeOfString:@"[加密]"].location == NSNotFound) {
-        return;
-    }
-
+    if (!DYShouldShowLine(line)) return;
     NSString *current = self.logTextView.text ?: @"";
-    NSString *newText = current.length > 0
-        ? [NSString stringWithFormat:@"%@\n%@", current, line]
-        : line;
+    NSString *newText = current.length > 0 ? [NSString stringWithFormat:@"%@\n%@", current, line] : line;
     self.logTextView.text = newText;
     NSRange bottom = NSMakeRange(newText.length - 1, 1);
     [self.logTextView scrollRangeToVisible:bottom];
 }
 
-// 根据当前过滤开关重刷面板全量日志（用于开关切换时刷新）
+// 根据当前过滤状态重刷（开关切换 / 搜索变化时调用）
 - (void)applyLogFilter {
     NSArray *all = [[DYLogManager sharedManager] allLogs];
     NSMutableArray<NSString *> *visible = [NSMutableArray array];
     for (NSString *line in all) {
-        if (gLogFilterKeyOnly) {
-            if ([line rangeOfString:@"[加密]"].location == NSNotFound) continue;
-        }
-        [visible addObject:line];
+        if (DYShouldShowLine(line)) [visible addObject:line];
     }
     self.logTextView.text = [visible componentsJoinedByString:@"\n"];
     if (visible.count > 0) {
@@ -1556,7 +1603,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     self.panelWindow.frame = screenBounds;
 
     CGFloat panelW = MIN(screenBounds.size.width, screenBounds.size.height) * 0.70;
-    CGFloat panelH = MAX(screenBounds.size.width, screenBounds.size.height) * 0.38;
+    CGFloat panelH = MAX(screenBounds.size.width, screenBounds.size.height) * 0.50;
 
     // 保持面板在屏幕内
     CGRect frame = self.frame;
