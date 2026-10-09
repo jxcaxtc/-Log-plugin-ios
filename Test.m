@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ============================================================================
  * 免责声明（DISCLAIMER）
  * ============================================================================
@@ -216,9 +216,20 @@ static BOOL gGlobalLogEnabled = YES;
         @autoreleasepool {
             [self->_logs addObject:line];
             [self->_pending addObject:line];
-            // 总日志上限 5000 条，超过删前 1000 条（避免频繁内存重分配）
-            if (self->_logs.count > 5000) {
-                [self->_logs removeObjectsInRange:NSMakeRange(0, 1000)];
+            // 总日志上限（用户自定义，默认 3000），超过一次性删 1/3 避免频繁重分配
+            static NSInteger cachedMax = -1;
+            NSInteger max = DYGetMaxLogLines();
+            if (max != cachedMax) {
+                // 用户刚改过上限，立刻 trim 到新上限
+                if (self->_logs.count > max) {
+                    [self->_logs removeObjectsInRange:NSMakeRange(0, self->_logs.count - max)];
+                }
+                cachedMax = max;
+            }
+            if (self->_logs.count > max) {
+                NSInteger drop = MAX(max / 3, 100);
+                if (self->_logs.count - max < drop) drop = self->_logs.count - max + (max / 3);
+                [self->_logs removeObjectsInRange:NSMakeRange(0, MIN(drop, self->_logs.count - max))];
             }
             // 节流：100ms 内攒一批，一次 flush 到主线程
             if (!self->_flushScheduled) {
@@ -1901,7 +1912,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     switch (section) {
         case 0: return 4; // 全局总开关 / 拦截抓包 / 加密捕获 / 只看加密
         case 1: return 2; // Keychain / UserDefaults
-        case 2: return 1; // 关于应用
+        case 2: return 2; // 日志限制 / 关于应用
         case 3: return 1; // 自定义 Hook 入口
         default: return 0;
     }
@@ -1919,18 +1930,33 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger s = indexPath.section;
-    // section 2: 关于应用
+    NSInteger r = indexPath.row;
+    // section 2: 日志限制 / 关于应用
     if (s == 2) {
-        static NSString *aboutId = @"DYAboutCell";
-        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:aboutId];
-        if (!cell) {
-            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:aboutId];
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        if (r == 0) {
+            // 日志限制（Value1 样式：左标题 + 右数值）
+            static NSString *limitId = @"DYLogLimitCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:limitId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:limitId];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"日志行数限制";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 行", (long)DYGetMaxLogLines()];
+            return cell;
+        } else {
+            static NSString *aboutId = @"DYAboutCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:aboutId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:aboutId];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"关于应用";
+            cell.detailTextLabel.text = @"v2.0";
+            return cell;
         }
-        cell.textLabel.text = @"关于应用";
-        cell.detailTextLabel.text = @"v2.0";
-        return cell;
     }
     // section 3: 自定义 Hook 入口
     if (s == 3) {
@@ -2027,11 +2053,50 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == 2 && indexPath.row == 0) {
+        [self showLogLimitPicker];
+    } else if (indexPath.section == 2 && indexPath.row == 1) {
         [self showAboutSheet];
     } else if (indexPath.section == 3 && indexPath.row == 0) {
         DYCustomHookViewController *vc = [[DYCustomHookViewController alloc] init];
         [self.navigationController pushViewController:vc animated:YES];
     }
+}
+
+// "日志行数限制" 输入框（UIAlertController 带数字输入）
+- (void)showLogLimitPicker {
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"日志行数限制"
+        message:@"输入允许保留的最大日志条数（100 ~ 50000）。超过此值后，最早的日志会被自动丢弃。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"3000";
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.text = [NSString stringWithFormat:@"%ld", (long)DYGetMaxLogLines()];
+        tf.clearButtonMode = UITextFieldViewModeAlways;
+    }];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UITextField *tf = alert.textFields.firstObject;
+        NSInteger val = tf.text.integerValue;
+        if (val < 100 || val > 50000) {
+            // 弹一次提示
+            UIAlertController *tip = [UIAlertController
+                alertControllerWithTitle:@"超出范围"
+                message:@"请输入 100 到 50000 之间的整数"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:tip animated:YES completion:nil];
+            return;
+        }
+        DYSetMaxLogLines(val);
+        // 保存/清空当前多余日志 + 刷新主面板显示
+        [[NSNotificationCenter defaultCenter] postNotificationName:DYLogDidUpdateNotification
+                                                            object:nil
+                                                          userInfo:@{@"clear": @NO, @"batch": @[]}];
+        [weakSelf.tableView reloadData];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 // "关于应用"半屏 sheet（UISheetPresentationController detents 固定半屏）
@@ -2478,8 +2543,26 @@ static BOOL DYShouldShowLine(NSString *line) {
     return YES;
 }
 
-// logTextView 显示上限：最多保留 3000 行（足够排查问题，又不会爆内存）
-#define DYMaxLogLinesInTextView 3000
+// 日志显示/存储行数上限（用户可自定义，默认 3000，持久化到 NSUserDefaults）
+static NSInteger gMaxLogLines = -1; // -1 = 未初始化，首次访问时从 UserDefaults 读
+
+static NSInteger DYGetMaxLogLines(void) {
+    if (gMaxLogLines < 0) {
+        NSNumber *saved = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYMaxLogLines"];
+        gMaxLogLines = saved ? saved.integerValue : 3000;
+        if (gMaxLogLines < 100) gMaxLogLines = 100;     // 最小值 100
+        if (gMaxLogLines > 50000) gMaxLogLines = 50000;  // 最大值 50000
+    }
+    return gMaxLogLines;
+}
+
+static void DYSetMaxLogLines(NSInteger value) {
+    if (value < 100) value = 100;
+    if (value > 50000) value = 50000;
+    gMaxLogLines = value;
+    [[NSUserDefaults standardUserDefaults] setInteger:value forKey:@"DYMaxLogLines"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
 
 - (void)onLogUpdate:(NSNotification *)note {
     NSDictionary *userInfo = note.userInfo;
@@ -2504,9 +2587,9 @@ static BOOL DYShouldShowLine(NSString *line) {
     // 行数保护：超过 2000 行，删顶部旧文本
     NSString *full = attr.string;
     NSUInteger lineCount = [[full componentsSeparatedByString:@"\n"] count];
-    if (lineCount > DYMaxLogLinesInTextView) {
+    if (lineCount > DYGetMaxLogLines()) {
         NSArray *lines = [full componentsSeparatedByString:@"\n"];
-        NSArray *tail = [lines subarrayWithRange:NSMakeRange(lines.count - DYMaxLogLinesInTextView, DYMaxLogLinesInTextView)];
+        NSArray *tail = [lines subarrayWithRange:NSMakeRange(lines.count - DYGetMaxLogLines(), DYGetMaxLogLines())];
         self.logTextView.text = [tail componentsJoinedByString:@"\n"];
     } else {
         self.logTextView.attributedText = attr;
@@ -2528,8 +2611,8 @@ static BOOL DYShouldShowLine(NSString *line) {
         if (DYShouldShowLine(line)) [visible addObject:line];
     }
     // UI 行数上限保护
-    if (visible.count > DYMaxLogLinesInTextView) {
-        visible = [[visible subarrayWithRange:NSMakeRange(visible.count - DYMaxLogLinesInTextView, DYMaxLogLinesInTextView)] mutableCopy];
+    if (visible.count > DYGetMaxLogLines()) {
+        visible = [[visible subarrayWithRange:NSMakeRange(visible.count - DYGetMaxLogLines(), DYGetMaxLogLines())] mutableCopy];
     }
     self.logTextView.text = [visible componentsJoinedByString:@"\n"];
     if (visible.count > 0) {
