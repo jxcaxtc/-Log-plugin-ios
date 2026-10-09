@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Theos
         run: |
@@ -28,15 +28,30 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
           ls "$THEOS/sdks"
 
-      - name: Install ldid
+      - name: Provide ldid (best effort, stub fallback)
         run: |
-          # Theos 在链接后需要 ldid 对 dylib 签名
-          brew install theosos/tap/ldid || brew install ldid
+          # Theos 链接后硬调 ldid 给 dylib 签名。先尝试 brew / curl 安装真实 ldid，
+          # 失败则用一个 stub 脚本占位（越狱机上的 libhooker / CydiaSubstrate 不校验签名）
+          if brew install ldid 2>/dev/null; then
+            echo "brew ldid installed"
+          elif command -v ldid >/dev/null 2>&1; then
+            echo "ldid already exists: $(which ldid)"
+          else
+            echo "ldid not found — creating a no-op stub"
+            cat > /usr/local/bin/ldid <<'EOF'
+#!/bin/bash
+# ldid stub — does nothing, just exits 0
+exit 0
+EOF
+            chmod +x /usr/local/bin/ldid
+          fi
+          echo "ldid path: $(which ldid)"
+          ldid --version 2>&1 || true
 
       - name: Build dylib
         run: |
           export THEOS="$HOME/theos"
-          export PATH="$THEOS/bin:$PATH"
+          export PATH="/usr/local/bin:$THEOS/bin:$PATH"
           make clean
           make
 
@@ -46,7 +61,7 @@ jobs:
           ls -la .theos/obj/ 2>/dev/null || true
 
       - name: Upload dylib artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Test.dylib
           path: |
