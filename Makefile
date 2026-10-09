@@ -29,7 +29,7 @@ Test_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 #   UIKit / Foundation   : 基础 UI 与对象
 #   Network              : NWPath / NWParameters
 #   CFNetwork            : CFNetworkCopySystemProxySettings
-Test_FRAMEWORKS = UIKit Foundation Network CFNetwork
+Test_FRAMEWORKS = UIKit Foundation Network CFNetwork CommonCrypto
 
 # 链接的动态库（libobjc 用于 runtime swizzle）
 Test_LDFLAGS = -lobjc

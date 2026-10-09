@@ -37,6 +37,8 @@
 #import <mach-o/dyld.h>                    // _dyld_register_func_for_add_image 等
 #import <dlfcn.h>
 #import <string.h>                         // strcmp
+#import <CommonCrypto/CommonCryptor.h>
+#import <CommonCrypto/CommonDigest.h>
 #import "fishhook.h"                       // fishhook rebind_symbols
 
 // ============================================================================
@@ -45,6 +47,25 @@
 
 // 统一的 NSLog 前缀，方便在设备控制台过滤
 #define DYLog(fmt, ...) NSLog((@"[DYMonitor] " fmt), ##__VA_ARGS__)
+
+// 把二进制数据转成 hex 字符串（用于密钥/明文日志展示）
+static NSString *DYHexFromBytes(const void *data, size_t len) {
+    if (!data || len == 0) return @"(empty)";
+    const uint8_t *p = (const uint8_t *)data;
+    size_t cap = len * 2 + 1;
+    char *buf = (char *)malloc(cap);
+    if (!buf) return @"(oom)";
+    for (size_t i = 0; i < len; i++) {
+        sprintf(buf + i * 2, "%02x", p[i]);
+    }
+    NSString *s = [NSString stringWithUTF8String:buf];
+    free(buf);
+    if (len > 64) s = [s stringByAppendingFormat:@"...(%zu bytes total)", len];
+    return s;
+}
+
+// 全局开关：加密监控是否启用
+static BOOL gDecryptMonitorEnabled = YES;
 
 // 获取当前时间戳字符串，格式：yyyy-MM-dd HH:mm:ss.SSS
 static NSString *DYTimestampString(void) {
@@ -863,6 +884,151 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
 @end
 
 // ============================================================================
+#pragma mark - 加密/哈希 密钥与明文捕获
+// ============================================================================
+// 设计：通过 fishhook 重绑定 CommonCrypto 的 C 函数调用，在 App 加密/哈希时
+//      捕获 AES key / iv / 明文 / 密文、MD5/SHA 的输入与输出等。
+// 开关：gDecryptMonitorEnabled，默认开启，可在面板 UISwitch 控制。
+// ============================================================================
+
+// ---- 原函数指针 ----
+static int (*DYOriginalCCCrypt)(CCOperation op, CCAlgorithm alg, CCOptions options,
+                                const void *key, size_t keyLength,
+                                const void *iv,
+                                const void *dataIn, size_t dataInLength,
+                                void *dataOut, size_t dataOutAvailable,
+                                size_t *dataOutMoved) = NULL;
+
+static int (*DYOriginalCC_MD5)(const void *data, CC_LONG len, unsigned char *md) = NULL;
+static int (*DYOriginalCC_SHA1)(const void *data, CC_LONG len, unsigned char *md) = NULL;
+static int (*DYOriginalCC_SHA256)(const void *data, CC_LONG len, unsigned char *md) = NULL;
+static int (*DYOriginalCC_SHA512)(const void *data, CC_LONG len, unsigned char *md) = NULL;
+
+// ---- AES 加密/解密 ----
+static int DYHookedCCCrypt(CCOperation op, CCAlgorithm alg, CCOptions options,
+                           const void *key, size_t keyLength,
+                           const void *iv,
+                           const void *dataIn, size_t dataInLength,
+                           void *dataOut, size_t dataOutAvailable,
+                           size_t *dataOutMoved) {
+    if (gDecryptMonitorEnabled) {
+        @autoreleasepool {
+            NSString *algName = @"Unknown";
+            switch (alg) {
+                case kCCAlgorithmAES: algName = @"AES"; break;
+                case kCCAlgorithmDES: algName = @"DES"; break;
+                case kCCAlgorithm3DES: algName = @"3DES"; break;
+                case kCCAlgorithmCAST: algName = @"CAST"; break;
+                case kCCAlgorithmRC4: algName = @"RC4"; break;
+                case kCCAlgorithmBlowfish: algName = @"Blowfish"; break;
+                default: algName = [NSString stringWithFormat:@"alg=%d", alg]; break;
+            }
+            NSString *opName = (op == kCCEncrypt) ? @"加密" : @"解密";
+            NSMutableString *msg = [NSMutableString stringWithFormat:
+                @"%@ %@ | key(%zu bytes): %@",
+                algName, opName, keyLength, DYHexFromBytes(key, keyLength)];
+            if (iv) [msg appendFormat:@" | iv: %@", DYHexFromBytes(iv, 16)];
+            [msg appendFormat:@" | 输入(%zu bytes): %@", dataInLength, DYHexFromBytes(dataIn, dataInLength)];
+
+            // 先调原函数拿到结果，再输出密文/明文
+            int result = DYOriginalCCCrypt(op, alg, options, key, keyLength, iv,
+                                            dataIn, dataInLength,
+                                            dataOut, dataOutAvailable, dataOutMoved);
+            if (result == kCCSuccess && dataOutMoved && *dataOutMoved > 0) {
+                [msg appendFormat:@" | 输出(%zu bytes): %@", *dataOutMoved,
+                                  DYHexFromBytes(dataOut, *dataOutMoved)];
+            }
+            [msg appendFormat:@" | options=0x%02x", options];
+            [[DYLogManager sharedManager] logWithCategory:@"加密" message:msg];
+            return result;
+        }
+    }
+    return DYOriginalCCCrypt(op, alg, options, key, keyLength, iv,
+                             dataIn, dataInLength,
+                             dataOut, dataOutAvailable, dataOutMoved);
+}
+
+// ---- MD5 / SHA ----
+static int DYHookedCC_MD5(const void *data, CC_LONG len, unsigned char *md) {
+    int result = DYOriginalCC_MD5(data, len, md);
+    if (gDecryptMonitorEnabled && result) {
+        @autoreleasepool {
+            [[DYLogManager sharedManager] logWithCategory:@"加密"
+                message:[NSString stringWithFormat:
+                    @"MD5 | 输入(%u bytes): %@ | 输出: %@",
+                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_MD5_DIGEST_LENGTH)]];
+        }
+    }
+    return result;
+}
+
+static int DYHookedCC_SHA1(const void *data, CC_LONG len, unsigned char *md) {
+    int result = DYOriginalCC_SHA1(data, len, md);
+    if (gDecryptMonitorEnabled && result) {
+        @autoreleasepool {
+            [[DYLogManager sharedManager] logWithCategory:@"加密"
+                message:[NSString stringWithFormat:
+                    @"SHA1 | 输入(%u bytes): %@ | 输出: %@",
+                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_SHA1_DIGEST_LENGTH)]];
+        }
+    }
+    return result;
+}
+
+static int DYHookedCC_SHA256(const void *data, CC_LONG len, unsigned char *md) {
+    int result = DYOriginalCC_SHA256(data, len, md);
+    if (gDecryptMonitorEnabled && result) {
+        @autoreleasepool {
+            [[DYLogManager sharedManager] logWithCategory:@"加密"
+                message:[NSString stringWithFormat:
+                    @"SHA256 | 输入(%u bytes): %@ | 输出: %@",
+                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_SHA256_DIGEST_LENGTH)]];
+        }
+    }
+    return result;
+}
+
+static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
+    int result = DYOriginalCC_SHA512(data, len, md);
+    if (gDecryptMonitorEnabled && result) {
+        @autoreleasepool {
+            [[DYLogManager sharedManager] logWithCategory:@"加密"
+                message:[NSString stringWithFormat:
+                    @"SHA512 | 输入(%u bytes): %@ | 输出: %@",
+                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_SHA512_DIGEST_LENGTH)]];
+        }
+    }
+    return result;
+}
+
+// ---- 监控模块 ----
+@interface DYDecryptMonitor : NSObject <DYMonitor>
+@end
+
+@implementation DYDecryptMonitor
+
+- (void)startMonitoring {
+    @autoreleasepool {
+        struct rebinding rebindings[] = {
+            { "CCCrypt",      (void *)DYHookedCCCrypt,     (void **)&DYOriginalCCCrypt },
+            { "CC_MD5",       (void *)DYHookedCC_MD5,      (void **)&DYOriginalCC_MD5 },
+            { "CC_SHA1",      (void *)DYHookedCC_SHA1,     (void **)&DYOriginalCC_SHA1 },
+            { "CC_SHA256",    (void *)DYHookedCC_SHA256,   (void **)&DYOriginalCC_SHA256 },
+            { "CC_SHA512",    (void *)DYHookedCC_SHA512,   (void **)&DYOriginalCC_SHA512 },
+        };
+        rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+        DYLog(@"加密监控 hook 已安装（CCCrypt / MD5 / SHA1 / SHA256 / SHA512）");
+        [[DYLogManager sharedManager] logWithCategory:@"系统"
+            message:@"加密/哈希 明文与密钥捕获已启动"];
+    }
+}
+
+- (void)stopMonitoring {
+}
+
+@end
+
+// ============================================================================
 #pragma mark - 悬浮监控面板
 // ============================================================================
 
@@ -898,7 +1064,10 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
 @property (nonatomic, strong) UIButton *saveButton;
 @property (nonatomic, strong) UIButton *clearButton;
 @property (nonatomic, strong) UIButton *closeButton;
-@property (nonatomic, strong) UIButton *bypassToggleButton; // 抓包检测拦截开关
+@property (nonatomic, strong) UISwitch *bypassSwitch;      // 抓包检测拦截
+@property (nonatomic, strong) UILabel *bypassLabel;
+@property (nonatomic, strong) UISwitch *decryptSwitch;    // 加密/哈希 明文捕获
+@property (nonatomic, strong) UILabel *decryptLabel;
 @property (nonatomic, strong) DYPanelWindow *panelWindow;
 @property (nonatomic, assign) BOOL isVisible;
 @property (nonatomic, strong) UILongPressGestureRecognizer *longPressGesture; // 长按拖动
@@ -988,15 +1157,35 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
     [self.clearButton addTarget:self action:@selector(handleClear) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.clearButton];
 
-    // 抓包检测拦截开关按钮（原生风格 segmented-style）
-    self.bypassToggleButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.bypassToggleButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    self.bypassToggleButton.layer.cornerRadius = 8.0;
-    self.bypassToggleButton.layer.borderWidth = 1.0;
-    self.bypassToggleButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.bypassToggleButton addTarget:self action:@selector(handleBypassToggle) forControlEvents:UIControlEventTouchUpInside];
-    [self updateBypassToggleAppearance];
-    [self addSubview:self.bypassToggleButton];
+    // 抓包检测拦截 —— 原生 UISwitch
+    self.bypassLabel = [[UILabel alloc] init];
+    self.bypassLabel.text = @"拦截应用检测抓包";
+    self.bypassLabel.font = [UIFont systemFontOfSize:13];
+    self.bypassLabel.textColor = [UIColor labelColor];
+    self.bypassLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:self.bypassLabel];
+
+    self.bypassSwitch = [[UISwitch alloc] init];
+    self.bypassSwitch.on = gBypassEnabled;
+    self.bypassSwitch.onTintColor = [UIColor systemGreenColor];
+    self.bypassSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.bypassSwitch addTarget:self action:@selector(handleBypassSwitch:) forControlEvents:UIControlEventValueChanged];
+    [self addSubview:self.bypassSwitch];
+
+    // 加密/哈希 明文捕获 —— 原生 UISwitch
+    self.decryptLabel = [[UILabel alloc] init];
+    self.decryptLabel.text = @"捕获加密/哈希 密钥与明文";
+    self.decryptLabel.font = [UIFont systemFontOfSize:13];
+    self.decryptLabel.textColor = [UIColor labelColor];
+    self.decryptLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:self.decryptLabel];
+
+    self.decryptSwitch = [[UISwitch alloc] init];
+    self.decryptSwitch.on = gDecryptMonitorEnabled;
+    self.decryptSwitch.onTintColor = [UIColor systemTealColor];
+    self.decryptSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.decryptSwitch addTarget:self action:@selector(handleDecryptSwitch:) forControlEvents:UIControlEventValueChanged];
+    [self addSubview:self.decryptSwitch];
 
     // Auto Layout
     [NSLayoutConstraint activateConstraints:@[
@@ -1023,13 +1212,19 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
         [self.logTextView.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:8],
         [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
         [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
-        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.bypassToggleButton.topAnchor constant:-8],
+        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.bypassLabel.topAnchor constant:-8],
 
-        // bypassToggleButton
-        [self.bypassToggleButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.bypassToggleButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-        [self.bypassToggleButton.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
-        [self.bypassToggleButton.heightAnchor constraintEqualToConstant:36],
+        // bypass 开关行（在 decrypt 行上面）
+        [self.bypassLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.bypassLabel.centerYAnchor constraintEqualToAnchor:self.bypassSwitch.centerYAnchor],
+        [self.bypassSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+
+        // decrypt 开关行（在 bypass 行下方，saveButton 上方）
+        [self.decryptLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.decryptLabel.centerYAnchor constraintEqualToAnchor:self.decryptSwitch.centerYAnchor],
+        [self.decryptSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [self.decryptLabel.topAnchor constraintEqualToAnchor:self.bypassLabel.bottomAnchor constant:6],
+        [self.decryptLabel.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
 
         // saveButton
         [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
@@ -1263,27 +1458,18 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
     [[DYLogManager sharedManager] clearLogs];
 }
 
-// 抓包检测拦截开关：切换全局 gBypassEnabled，并刷新按钮外观
-- (void)handleBypassToggle {
-    gBypassEnabled = !gBypassEnabled;
-    [self updateBypassToggleAppearance];
+// 抓包检测拦截 —— UISwitch
+- (void)handleBypassSwitch:(UISwitch *)sender {
+    gBypassEnabled = sender.isOn;
     [[DYLogManager sharedManager] logWithCategory:@"系统"
         message:[NSString stringWithFormat:@"抓包检测拦截已%@", gBypassEnabled ? @"开启" : @"关闭"]];
 }
 
-// 根据开关状态刷新按钮标题与颜色
-- (void)updateBypassToggleAppearance {
-    NSString *title = [NSString stringWithFormat:@"拦截应用检测抓包：%@", gBypassEnabled ? @"开" : @"关"];
-    [self.bypassToggleButton setTitle:title forState:UIControlStateNormal];
-    if (gBypassEnabled) {
-        self.bypassToggleButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.12];
-        self.bypassToggleButton.layer.borderColor = [UIColor systemGreenColor].CGColor;
-        [self.bypassToggleButton setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
-    } else {
-        self.bypassToggleButton.backgroundColor = [UIColor colorWithWhite:0.95 alpha:1.0];
-        self.bypassToggleButton.layer.borderColor = [UIColor systemGrayColor].CGColor;
-        [self.bypassToggleButton setTitleColor:[UIColor systemGrayColor] forState:UIControlStateNormal];
-    }
+// 加密/哈希 明文捕获 —— UISwitch
+- (void)handleDecryptSwitch:(UISwitch *)sender {
+    gDecryptMonitorEnabled = sender.isOn;
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:[NSString stringWithFormat:@"加密/哈希 明文与密钥捕获已%@", gDecryptMonitorEnabled ? @"开启" : @"关闭"]];
 }
 
 // 递归获取最顶层的 view controller
@@ -1364,6 +1550,10 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
         // 抓包 / VPN 探测屏蔽模块
         DYNetworkBypassMonitor *bypassMonitor = [[DYNetworkBypassMonitor alloc] init];
         [bypassMonitor startMonitoring];
+
+        // 加密 / 哈希 密钥与明文捕获
+        DYDecryptMonitor *decryptMonitor = [[DYDecryptMonitor alloc] init];
+        [decryptMonitor startMonitoring];
 
         // 后续新增监控模块在此处注册即可，例如：
         // DYNetworkMonitor *netMonitor = [[DYNetworkMonitor alloc] init];
