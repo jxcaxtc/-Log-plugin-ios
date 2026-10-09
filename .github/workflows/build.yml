@@ -1,0 +1,48 @@
+name: Build Dylib
+
+# 触发条件：push 到 main/master 分支，或手动触发
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build libTest.dylib
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        run: |
+          # 克隆 Theos 到固定目录
+          export THEOS="$HOME/theos"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          # 下载 iOS SDK（15.5，兼容绝大多数设备）
+          curl -L "https://github.com/theos/sdks/raw/master/iPhoneOS15.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
+          mkdir -p "$THEOS/sdks"
+          tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
+          ls "$THEOS/sdks"
+
+      - name: Build dylib
+        run: |
+          export THEOS="$HOME/theos"
+          export PATH="$THEOS/bin:$PATH"
+          make clean
+          make
+
+      - name: Show output
+        run: |
+          find . -name "*.dylib" -type f | head -20
+          ls -la .theos/obj/ 2>/dev/null || true
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libTest.dylib
+          path: |
+            .theos/obj/debug/libTest.dylib
+            .theos/obj/libTest.dylib
+          if-no-files-found: warn
