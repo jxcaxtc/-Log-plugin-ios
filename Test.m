@@ -1213,12 +1213,10 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 }
 
 // 辅助：创建一个 iOS Settings 风格的行容器（左边 label + 右边 switch）
-// dividerTop/Bottom 控制是否显示分隔线（section 第一行顶部分割线隐藏，最后一行底部隐藏）
 - (UIView *)makeSwitchRowWithTitle:(NSString *)title
                             target:(id)target
                             action:(SEL)action
                          switchOn:(BOOL)on
-                      switchColor:(UIColor *)onColor
                        dividerTop:(BOOL)divTop
                     dividerBottom:(BOOL)divBottom {
     UIView *row = [[UIView alloc] init];
@@ -1227,14 +1225,13 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 
     UILabel *label = [[UILabel alloc] init];
     label.text = title;
-    label.font = [UIFont systemFontOfSize:15];
-    label.textColor = [UIColor labelColor];
+    // 不指定 font / textColor，让 label 走系统默认（body / label color）
     label.translatesAutoresizingMaskIntoConstraints = NO;
     [row addSubview:label];
 
     UISwitch *sw = [[UISwitch alloc] init];
     sw.on = on;
-    sw.onTintColor = onColor;
+    // 不指定 onTintColor，用系统默认（iOS 原生绿色）
     sw.translatesAutoresizingMaskIntoConstraints = NO;
     [sw addTarget:target action:action forControlEvents:UIControlEventValueChanged];
     [row addSubview:sw];
@@ -1295,16 +1292,13 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 
     UILabel *titleLabel = [[UILabel alloc] init];
     titleLabel.text = @"行为监控";
+    // 用系统默认 label 样式（导航栏大号加粗）
     titleLabel.textColor = [UIColor labelColor];
-    titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [titleBar addSubview:titleLabel];
 
     self.closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.closeButton setTitle:@"关闭" forState:UIControlStateNormal];
-    [self.closeButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
-    self.closeButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
-    self.closeButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.closeButton addTarget:self action:@selector(handleClose) forControlEvents:UIControlEventTouchUpInside];
     [titleBar addSubview:self.closeButton];
 
@@ -1322,21 +1316,18 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
                                          target:self
                                          action:@selector(handleBypassSwitch:)
                                        switchOn:gBypassEnabled
-                                    switchColor:[UIColor systemGreenColor]
                                      dividerTop:YES
                                   dividerBottom:NO];
     UIView *row2 = [self makeSwitchRowWithTitle:@"捕获加密/哈希 密钥与明文"
                                          target:self
                                          action:@selector(handleDecryptSwitch:)
                                        switchOn:gDecryptMonitorEnabled
-                                    switchColor:[UIColor systemTealColor]
                                      dividerTop:NO
                                   dividerBottom:NO];
     UIView *row3 = [self makeSwitchRowWithTitle:@"只显示密钥/加密日志"
                                          target:self
                                          action:@selector(handleFilterSwitch:)
                                        switchOn:gLogFilterKeyOnly
-                                    switchColor:[UIColor systemOrangeColor]
                                      dividerTop:NO
                                   dividerBottom:YES];
     [self.settingsSection addSubview:row1];
@@ -1359,7 +1350,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [row3.bottomAnchor constraintEqualToAnchor:self.settingsSection.bottomAnchor],
     ]];
 
-    // 日志区
+    // 日志区（全部系统默认：secondaryLabelColor + 系统字体）
     self.logTextView = [[UITextView alloc] init];
     self.logTextView.editable = NO;
     self.logTextView.scrollEnabled = YES;
@@ -1367,8 +1358,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     self.logTextView.layer.cornerRadius = 10.0;
     self.logTextView.layer.borderWidth = 0.5;
     self.logTextView.layer.borderColor = [UIColor colorWithWhite:0.9 alpha:1.0].CGColor;
-    self.logTextView.textColor = [UIColor systemGray2Color];
-    self.logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
+    // 不指定 textColor / font，走系统默认（系统字体 + 次要文本色）
     self.logTextView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
     self.logTextView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.logTextView];
@@ -1377,16 +1367,12 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     self.saveButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.saveButton setTitle:@"保存日志" forState:UIControlStateNormal];
     self.saveButton.tintColor = [UIColor systemBlueColor];
-    self.saveButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    self.saveButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.saveButton addTarget:self action:@selector(handleSave) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.saveButton];
 
     self.clearButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.clearButton setTitle:@"清空" forState:UIControlStateNormal];
     self.clearButton.tintColor = [UIColor systemRedColor];
-    self.clearButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    self.clearButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.clearButton addTarget:self action:@selector(handleClear) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.clearButton];
 
