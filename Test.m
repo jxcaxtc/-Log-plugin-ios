@@ -164,6 +164,42 @@ static NSString *const DYLogDidUpdateNotification = @"DYLogDidUpdateNotification
 // ----------------------------------------------------------------------------
 static BOOL gBypassEnabled = YES;
 
+// 防崩溃开关：hook exit() / abort()，拦截 App 因 VPN / 抓包检测触发的主动闪退
+static BOOL gAntiCrashEnabled = YES;
+static void (*gOrigExit)(int) = NULL;
+static void (*gOrigAbort)(void) = NULL;
+static void (*gOrig_Exit)(int) = NULL;
+
+static void DYPatchedExit(int code) {
+    if (gAntiCrashEnabled) {
+        [[DYLogManager sharedManager] logWithCategory:@"防崩溃"
+            message:[NSString stringWithFormat:@"⚠️ 拦截 exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code]];
+        return; // 直接吞掉，不退出
+    }
+    if (gOrigExit) gOrigExit(code);
+    else exit(code);
+}
+static void DYPatched_Exit(int code) {
+    if (gAntiCrashEnabled) {
+        [[DYLogManager sharedManager] logWithCategory:@"防崩溃"
+            message:[NSString stringWithFormat:@"⚠️ 拦截 _Exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code]];
+        return;
+    }
+    if (gOrig_Exit) gOrig_Exit(code);
+    else _Exit(code);
+}
+static void DYPatchedAbort(void) {
+    if (gAntiCrashEnabled) {
+        // 打印调用栈帮助定位是哪段代码触发的 abort
+        NSString *stack = [NSThread callStackSymbols].componentsJoinedByString:@"\n    "];
+        [[DYLogManager sharedManager] logWithCategory:@"防崩溃"
+            message:[NSString stringWithFormat:@"⚠️ 拦截 abort() —— 疑似 VPN/环境检测触发。调用栈:\n    %@", stack ?: @"(空)"]];
+        return; // 吞掉，不崩溃
+    }
+    if (gOrigAbort) gOrigAbort();
+    else abort();
+}
+
 // 全局总开关：关闭后所有日志不捕获、不显示，但 hook 仍在运行
 static BOOL gGlobalLogEnabled = YES;
 
@@ -2045,7 +2081,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
-        case 0: return 4; // 全局总开关 / 拦截抓包 / 加密捕获 / 只看加密
+        case 0: return 5; // 全局总开关 / 拦截抓包 / 防崩溃 / 加密捕获 / 只看加密
         case 1: return 2; // Keychain / UserDefaults
         case 2: return 2; // 日志限制 / 关于应用
         case 3: return 1; // 自定义 Hook 入口
@@ -2130,6 +2166,10 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
             sw.on = gBypassEnabled;
             [sw addTarget:self action:@selector(toggleBypass:) forControlEvents:UIControlEventValueChanged];
         } else if (r == 2) {
+            cell.textLabel.text = @"防崩溃（拦截主动退出）";
+            sw.on = gAntiCrashEnabled;
+            [sw addTarget:self action:@selector(toggleAntiCrash:) forControlEvents:UIControlEventValueChanged];
+        } else if (r == 3) {
             cell.textLabel.text = @"捕获加密/哈希 密钥与明文";
             sw.on = gDecryptMonitorEnabled;
             [sw addTarget:self action:@selector(toggleDecrypt:) forControlEvents:UIControlEventValueChanged];
@@ -2162,6 +2202,15 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     gBypassEnabled = sw.isOn;
     [[DYLogManager sharedManager] logWithCategory:@"系统"
         message:[NSString stringWithFormat:@"拦截应用检测抓包已%@", sw.isOn ? @"开启" : @"关闭"]];
+}
+- (void)toggleAntiCrash:(UISwitch *)sw {
+    gAntiCrashEnabled = sw.isOn;
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:[NSString stringWithFormat:@"防崩溃（拦截主动退出）已%@", sw.isOn ? @"开启" : @"关闭"]];
+    if (!sw.isOn) {
+        [[DYLogManager sharedManager] logWithCategory:@"防崩溃"
+            message:@"⚠️ 防崩溃已关闭 —— 注意：下次 App 启动前无法重新 hook，如需再次生效请重启 App 或重新打开开关后 hook 立即生效（无需重启）"];
+    }
 }
 - (void)toggleDecrypt:(UISwitch *)sw {
     gDecryptMonitorEnabled = sw.isOn;
@@ -3015,6 +3064,18 @@ static BOOL DYShouldShowLine(NSString *line) {
         // Keychain 访问监控（SecItemAdd/CopyMatching/Update/Delete）
         DYKeychainMonitor *keychainMonitor = [[DYKeychainMonitor alloc] init];
         [keychainMonitor startMonitoring];
+
+        // 防崩溃：hook exit / abort / _Exit，拦截 VPN/环境检测触发的主动闪退
+        if (gAntiCrashEnabled) {
+            struct rebind crashRebinds[] = {
+                { "exit",    (void *)&DYPatchedExit,    (void **)&gOrigExit },
+                { "_Exit",   (void *)&DYPatched_Exit,   (void **)&gOrig_Exit },
+                { "abort",   (void *)&DYPatchedAbort,   (void **)&gOrigAbort },
+            };
+            rebind_symbols(crashRebinds, sizeof(crashRebinds) / sizeof(crashRebinds[0]));
+            [[DYLogManager sharedManager] logWithCategory:@"系统"
+                message:@"✅ 防崩溃已启动（拦截 exit/abort/_Exit）"];
+        }
 
         // UserDefaults 读写监控通过 +load swizzle 自动生效，无需手动注册
 
