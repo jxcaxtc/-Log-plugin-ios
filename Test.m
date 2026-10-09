@@ -1329,7 +1329,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 
         UILabel *lb = [[UILabel alloc] init];
         lb.text = title;
-        lb.font = [UIFont systemFontOfSize:12];
+        lb.font = [UIFont systemFontOfSize:15];
         lb.textColor = [UIColor labelColor];
         lb.textAlignment = NSTextAlignmentCenter;
         lb.numberOfLines = 1;
