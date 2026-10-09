@@ -67,6 +67,9 @@ static NSString *DYHexFromBytes(const void *data, size_t len) {
 // 全局开关：加密监控是否启用
 static BOOL gDecryptMonitorEnabled = YES;
 
+// 全局开关：UI 日志过滤（YES 时面板只显示 category=="加密" 的密钥/明文类日志；NO 时显示全部）
+static BOOL gLogFilterKeyOnly = NO;
+
 // 获取当前时间戳字符串，格式：yyyy-MM-dd HH:mm:ss.SSS
 static NSString *DYTimestampString(void) {
     static NSDateFormatter *formatter = nil;
@@ -1068,6 +1071,8 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
 @property (nonatomic, strong) UILabel *bypassLabel;
 @property (nonatomic, strong) UISwitch *decryptSwitch;    // 加密/哈希 明文捕获
 @property (nonatomic, strong) UILabel *decryptLabel;
+@property (nonatomic, strong) UISwitch *filterSwitch;      // 只显示密钥相关日志
+@property (nonatomic, strong) UILabel *filterLabel;
 @property (nonatomic, strong) DYPanelWindow *panelWindow;
 @property (nonatomic, assign) BOOL isVisible;
 @property (nonatomic, strong) UILongPressGestureRecognizer *longPressGesture; // 长按拖动
@@ -1187,6 +1192,21 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
     [self.decryptSwitch addTarget:self action:@selector(handleDecryptSwitch:) forControlEvents:UIControlEventValueChanged];
     [self addSubview:self.decryptSwitch];
 
+    // 只显示密钥相关日志 —— 原生 UISwitch
+    self.filterLabel = [[UILabel alloc] init];
+    self.filterLabel.text = @"只显示密钥/加密日志";
+    self.filterLabel.font = [UIFont systemFontOfSize:13];
+    self.filterLabel.textColor = [UIColor labelColor];
+    self.filterLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:self.filterLabel];
+
+    self.filterSwitch = [[UISwitch alloc] init];
+    self.filterSwitch.on = gLogFilterKeyOnly;
+    self.filterSwitch.onTintColor = [UIColor systemOrangeColor];
+    self.filterSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.filterSwitch addTarget:self action:@selector(handleFilterSwitch:) forControlEvents:UIControlEventValueChanged];
+    [self addSubview:self.filterSwitch];
+
     // Auto Layout
     [NSLayoutConstraint activateConstraints:@[
         // titleBar
@@ -1219,12 +1239,18 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
         [self.bypassLabel.centerYAnchor constraintEqualToAnchor:self.bypassSwitch.centerYAnchor],
         [self.bypassSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
 
-        // decrypt 开关行（在 bypass 行下方，saveButton 上方）
+        // decrypt 开关行（在 bypass 行下方）
         [self.decryptLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
         [self.decryptLabel.centerYAnchor constraintEqualToAnchor:self.decryptSwitch.centerYAnchor],
         [self.decryptSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
         [self.decryptLabel.topAnchor constraintEqualToAnchor:self.bypassLabel.bottomAnchor constant:6],
-        [self.decryptLabel.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
+
+        // filter 开关行（在 decrypt 行下方，saveButton 上方）
+        [self.filterLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.filterLabel.centerYAnchor constraintEqualToAnchor:self.filterSwitch.centerYAnchor],
+        [self.filterSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [self.filterLabel.topAnchor constraintEqualToAnchor:self.decryptLabel.bottomAnchor constant:6],
+        [self.filterLabel.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
 
         // saveButton
         [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
@@ -1262,14 +1288,36 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
     }
     NSString *line = userInfo[@"line"];
     if (!line) return;
+
+    // 过滤：开了 "只显示密钥" 时，只把 [加密] category 显示到面板
+    if (gLogFilterKeyOnly && [line rangeOfString:@"[加密]"].location == NSNotFound) {
+        return;
+    }
+
     NSString *current = self.logTextView.text ?: @"";
     NSString *newText = current.length > 0
         ? [NSString stringWithFormat:@"%@\n%@", current, line]
         : line;
     self.logTextView.text = newText;
-    // 自动滚动到底部
     NSRange bottom = NSMakeRange(newText.length - 1, 1);
     [self.logTextView scrollRangeToVisible:bottom];
+}
+
+// 根据当前过滤开关重刷面板全量日志（用于开关切换时刷新）
+- (void)applyLogFilter {
+    NSArray *all = [[DYLogManager sharedManager] allLogs];
+    NSMutableArray<NSString *> *visible = [NSMutableArray array];
+    for (NSString *line in all) {
+        if (gLogFilterKeyOnly) {
+            if ([line rangeOfString:@"[加密]"].location == NSNotFound) continue;
+        }
+        [visible addObject:line];
+    }
+    self.logTextView.text = [visible componentsJoinedByString:@"\n"];
+    if (visible.count > 0) {
+        NSRange bottom = NSMakeRange(self.logTextView.text.length - 1, 1);
+        [self.logTextView scrollRangeToVisible:bottom];
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1470,6 +1518,14 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
     gDecryptMonitorEnabled = sender.isOn;
     [[DYLogManager sharedManager] logWithCategory:@"系统"
         message:[NSString stringWithFormat:@"加密/哈希 明文与密钥捕获已%@", gDecryptMonitorEnabled ? @"开启" : @"关闭"]];
+}
+
+// 只显示密钥/加密日志 —— UISwitch
+- (void)handleFilterSwitch:(UISwitch *)sender {
+    gLogFilterKeyOnly = sender.isOn;
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:[NSString stringWithFormat:@"面板日志过滤：%@", gLogFilterKeyOnly ? @"只显示加密/密钥类" : @"显示全部"]];
+    [self applyLogFilter];
 }
 
 // 递归获取最顶层的 view controller
