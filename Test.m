@@ -37,6 +37,7 @@
 #import <mach-o/dyld.h>                    // 符号重绑定
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
+#import <mach/mach.h>                      // vm_protect
 #import <dlfcn.h>
 #import <string.h>                         // strcmp
 
@@ -143,7 +144,8 @@ static void DYRebindIndirectSymbolPointers(DYRebinding *rebindings, int count,
 
 // 处理单个镜像的符号重绑定
 static void DYProcessImage(struct mach_header_64 *header, intptr_t slide,
-                           DYRebinding *rebindings, int count) {
+                           DYRebinding *rebindings, int count,
+                           const char *skipImageName) {
     struct segment_command_64 *linkeditSeg = NULL;
     struct symtab_command *symtabCmd = NULL;
     struct dysymtab_command *dysymtabCmd = NULL;
@@ -179,15 +181,26 @@ static void DYProcessImage(struct mach_header_64 *header, intptr_t slide,
             struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
             struct section_64 *sect = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
             for (uint32_t j = 0; j < seg->nsects; j++) {
-                if ((sect[j].flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
-                    (sect[j].flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS ||
-                    (sect[j].flags & SECTION_TYPE) == S_SYMBOL_STUBS) {
+                uint32_t stype = sect[j].flags & SECTION_TYPE;
+                if (stype == S_LAZY_SYMBOL_POINTERS ||
+                    stype == S_NON_LAZY_SYMBOL_POINTERS ||
+                    stype == S_SYMBOL_STUBS) {
                     void **symbolPointers = (void **)((uint8_t *)header + slide + sect[j].addr);
                     uint32_t count2 = sect[j].size / sizeof(void *);
                     uint32_t *indirect = &indirectSymtab[sect[j].reserved1];
-                    if ((sect[j].flags & SECTION_TYPE) == S_SYMBOL_STUBS) {
+                    if (stype == S_SYMBOL_STUBS) {
+                        if (sect[j].reserved2 == 0) continue;
                         count2 = sect[j].size / sect[j].reserved2;
                     }
+
+                    // 修改前先 vm_protect 把该 section 覆盖的页设为可写
+                    // iOS 上 __DATA 段默认只读，直接写会 SIGSEGV
+                    vm_address_t pageAddr = (vm_address_t)symbolPointers & ~(vm_page_size - 1);
+                    vm_size_t pageSize = (vm_address_t)((uint8_t *)symbolPointers + sect[j].size - 1 + vm_page_size - 1) & ~(vm_page_size - 1);
+                    pageSize -= pageAddr;
+                    vm_protect(mach_task_self(), pageAddr, pageSize, FALSE,
+                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+
                     DYRebindIndirectSymbolPointers(rebindings, count, indirect,
                                                    symtab, strtab, symbolPointers, count2);
                 }
@@ -199,13 +212,22 @@ static void DYProcessImage(struct mach_header_64 *header, intptr_t slide,
 
 // 对所有已加载镜像执行重绑定
 static void DYRebindSymbols(DYRebinding *rebindings, int count) {
-    // 先对已有镜像执行
+    // 找到 Test.dylib 自己的名字，遍历时跳过，避免改自身 GOT 造成 re-entry
+    const char *selfName = NULL;
+    Dl_info info;
+    if (dladdr((void *)DYRebindSymbols, &info)) {
+        selfName = info.dli_fname;
+    }
+
     uint32_t imageCount = _dyld_image_count();
     for (uint32_t i = 0; i < imageCount; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (selfName && name && strstr(name, "Test.dylib")) continue;
+
         const struct mach_header *header = _dyld_get_image_header(i);
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
         if (header->magic == MH_MAGIC_64) {
-            DYProcessImage((struct mach_header_64 *)header, slide, rebindings, count);
+            DYProcessImage((struct mach_header_64 *)header, slide, rebindings, count, selfName);
         }
     }
 }
