@@ -5,8 +5,8 @@
 #           make package  —— 不可用（无 control 文件，本项目不产出 deb）
 # ============================================================================
 
-# 目标平台：iOS，使用 clang，最低支持 iOS 12.0
-TARGET := iphone:clang:latest:12.0
+# 目标平台：iOS，使用 clang，最低支持 iOS 17.0
+TARGET := iphone:clang:latest:17.0
 
 # 架构：覆盖现代 iOS 设备
 ARCHS = arm64 arm64e
