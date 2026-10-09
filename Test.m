@@ -1225,7 +1225,9 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 
     UILabel *label = [[UILabel alloc] init];
     label.text = title;
-    // 不指定 font / textColor，让 label 走系统默认（body / label color）
+    // Settings 行标准字号 15pt，labelColor
+    label.font = [UIFont systemFontOfSize:15];
+    label.textColor = [UIColor labelColor];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     [row addSubview:label];
 
@@ -1299,6 +1301,8 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 
     self.closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.closeButton setTitle:@"关闭" forState:UIControlStateNormal];
+    self.closeButton.titleLabel.font = [UIFont systemFontOfSize:15];
+    self.closeButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.closeButton addTarget:self action:@selector(handleClose) forControlEvents:UIControlEventTouchUpInside];
     [titleBar addSubview:self.closeButton];
 
@@ -1311,20 +1315,20 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     self.settingsSection.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.settingsSection];
 
-    // 3 个开关行（Settings 风格，相邻行之间自动显示内部分割线）
-    UIView *row1 = [self makeSwitchRowWithTitle:@"拦截应用检测抓包"
+    // 3 个开关行（Settings 风格，文字尽量简短）
+    UIView *row1 = [self makeSwitchRowWithTitle:@"过抓包检测"
                                          target:self
                                          action:@selector(handleBypassSwitch:)
                                        switchOn:gBypassEnabled
                                      dividerTop:YES
                                   dividerBottom:NO];
-    UIView *row2 = [self makeSwitchRowWithTitle:@"捕获加密/哈希 密钥与明文"
+    UIView *row2 = [self makeSwitchRowWithTitle:@"捕获密钥"
                                          target:self
                                          action:@selector(handleDecryptSwitch:)
                                        switchOn:gDecryptMonitorEnabled
                                      dividerTop:NO
                                   dividerBottom:NO];
-    UIView *row3 = [self makeSwitchRowWithTitle:@"只显示密钥/加密日志"
+    UIView *row3 = [self makeSwitchRowWithTitle:@"只看加密"
                                          target:self
                                          action:@selector(handleFilterSwitch:)
                                        switchOn:gLogFilterKeyOnly
@@ -1358,21 +1362,26 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     self.logTextView.layer.cornerRadius = 10.0;
     self.logTextView.layer.borderWidth = 0.5;
     self.logTextView.layer.borderColor = [UIColor colorWithWhite:0.9 alpha:1.0].CGColor;
-    // 不指定 textColor / font，走系统默认（系统字体 + 次要文本色）
+    self.logTextView.textColor = [UIColor secondaryLabelColor];
+    self.logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
     self.logTextView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
     self.logTextView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.logTextView];
 
     // 保存 / 清空按钮（底部原生 tinted）
     self.saveButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.saveButton setTitle:@"保存日志" forState:UIControlStateNormal];
+    [self.saveButton setTitle:@"保存" forState:UIControlStateNormal];
     self.saveButton.tintColor = [UIColor systemBlueColor];
+    self.saveButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    self.saveButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.saveButton addTarget:self action:@selector(handleSave) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.saveButton];
 
     self.clearButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.clearButton setTitle:@"清空" forState:UIControlStateNormal];
     self.clearButton.tintColor = [UIColor systemRedColor];
+    self.clearButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    self.clearButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.clearButton addTarget:self action:@selector(handleClear) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.clearButton];
 
