@@ -1224,13 +1224,19 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 // ============================================================================
 #import <Security/Security.h>
 
-typedef OSStatus (*DYSecItemFuncRef)(CFDictionaryRef query, CFTypeRef *result);
-typedef OSStatus (*DYSecItemCopyFuncRef)(CFDictionaryRef query, CFTypeRef *result);
+// 函数指针 typedef（和 Security.framework 真实签名对齐）
+// SecItemAdd / SecItemCopyMatching：两参数，第二个是 CFTypeRef *（输出结果）
+// SecItemUpdate：两参数都是 CFDictionaryRef（query + attributesToUpdate）
+// SecItemDelete：只有一个 CFDictionaryRef 参数
+typedef OSStatus (*DYSecItemAddRef)(CFDictionaryRef query, CFTypeRef *result);
+typedef OSStatus (*DYSecItemCopyRef)(CFDictionaryRef query, CFTypeRef *result);
+typedef OSStatus (*DYSecItemUpdateRef)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+typedef OSStatus (*DYSecItemDeleteRef)(CFDictionaryRef query);
 
-static DYSecItemFuncRef DYOrigSecItemAdd = NULL;
-static DYSecItemFuncRef DYOrigSecItemUpdate = NULL;
-static DYSecItemFuncRef DYOrigSecItemDelete = NULL;
-static DYSecItemCopyFuncRef DYOrigSecItemCopyMatching = NULL;
+static DYSecItemAddRef DYOrigSecItemAdd = NULL;
+static DYSecItemCopyRef DYOrigSecItemCopyMatching = NULL;
+static DYSecItemUpdateRef DYOrigSecItemUpdate = NULL;
+static DYSecItemDeleteRef DYOrigSecItemDelete = NULL;
 
 static NSString *DYKeychainItemDescription(CFDictionaryRef query, CFTypeRef result) {
     NSMutableString *out = [NSMutableString string];
@@ -1238,7 +1244,7 @@ static NSString *DYKeychainItemDescription(CFDictionaryRef query, CFTypeRef resu
     if (q[@"acct"]) [out appendFormat:@"account=%@; ", q[@"acct"]];
     if (q[@"svce"]) [out appendFormat:@"service=%@; ", q[@"svce"]];
     if (q[@"clss"]) {
-        NSString *cls = (__bridge NSString *)q[@"clss"];
+        NSString *cls = q[@"clss"];  // ObjC 对象，直接赋
         if ([cls isEqualToString:(__bridge NSString *)kSecClassGenericPassword]) cls = @"GenericPassword";
         else if ([cls isEqualToString:(__bridge NSString *)kSecClassInternetPassword]) cls = @"InternetPassword";
         else if ([cls isEqualToString:(__bridge NSString *)kSecClassCertificate]) cls = @"Certificate";
@@ -1314,7 +1320,7 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
 @end
 @implementation DYKeychainMonitor
 - (void)startMonitoring {
-    struct rebind rebindings[] = {
+    struct rebinding rebindings[] = {
         { "SecItemAdd",          (void *)DYHookedSecItemAdd,          (void **)&DYOrigSecItemAdd },
         { "SecItemCopyMatching", (void *)DYHookedSecItemCopyMatching, (void **)&DYOrigSecItemCopyMatching },
         { "SecItemUpdate",       (void *)DYHookedSecItemUpdate,       (void **)&DYOrigSecItemUpdate },
