@@ -182,8 +182,8 @@ static BOOL gBypassEnabled = YES;
     dispatch_async(_queue, ^{
         @autoreleasepool {
             [self->_logs addObject:line];
-            // 限制最多保留 5000 条，避免内存无限增长
-            if (self->_logs.count > 5000) {
+            // 限制最多保留 9000 条，避免内存无限增长
+            if (self->_logs.count > 9000) {
                 [self->_logs removeObjectsInRange:NSMakeRange(0, self->_logs.count - 5000)];
             }
             NSString *copiedLine = [line copy];
@@ -1291,7 +1291,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     [self addSubview:titleBar];
 
     UILabel *titleLabel = [[UILabel alloc] init];
-    titleLabel.text = @"行为监控";
+    titleLabel.text = @"太平长安-应用助手";
     // 用系统默认 label 样式（导航栏大号加粗）
     titleLabel.textColor = [UIColor labelColor];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;

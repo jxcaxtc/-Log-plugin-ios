@@ -25,15 +25,12 @@ Test_FILES = Test.m fishhook.c
 #   -Wno-deprecated-declarations : 忽略 UIActionSheet 等废弃 API 警告
 Test_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
-# 链接框架
-#   UIKit / Foundation   : 基础 UI 与对象
-#   Network              : NWPath / NWParameters
-#   CFNetwork            : CFNetworkCopySystemProxySettings
-Test_FRAMEWORKS = UIKit Foundation Network CFNetwork CommonCrypto
-Test_LIBRARIES = sqlite3
+# 链接框架（CommonCrypto 是系统 TBD 库，放 LIBRARIES 不是 FRAMEWORKS）
+Test_FRAMEWORKS = UIKit Foundation Network CFNetwork
+# sqlite3 + CommonCrypto 都是 lib*.tbd，作为系统库链接
+Test_LIBRARIES = sqlite3 commoncrypto
 
-# 链接的动态库（libobjc 用于 runtime swizzle）
-Test_LDFLAGS = -lobjc
+# -lobjc 是 Theos 默认链接的，不用重复指定
 
 # 引入 library.mk 规则
 include $(THEOS_MAKE_PATH)/library.mk
