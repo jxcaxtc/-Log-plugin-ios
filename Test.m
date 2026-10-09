@@ -1414,6 +1414,7 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
 #pragma mark - 设置全屏页（iOS Settings 原生风格，UITableViewStyleInsetGrouped）
 // ============================================================================
 @interface DYSettingsViewController : UITableViewController
+@property (nonatomic, copy) void (^dismissCallback)(void);
 @end
 
 @implementation DYSettingsViewController {
@@ -1438,7 +1439,10 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
 }
 
 - (void)handleDone {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    __weak DYSettingsViewController *weakSelf = self;
+    [self dismissViewControllerAnimated:YES completion:^{
+        if (weakSelf.dismissCallback) weakSelf.dismissCallback();
+    }];
 }
 
 #pragma mark - Table view data source
@@ -1729,12 +1733,25 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
 
 // 打开全屏设置页
 - (void)handleSettings {
+    // 关键：panelWindow.windowLevel = UIWindowLevelAlert + 1000，
+    // 比 App keyWindow 高。如果直接 present 到 App window，nav 会被 panelWindow 盖住，
+    // 用户看不到也摸不到。正确做法是临时隐藏 panelWindow，dismiss 后恢复。
+    self.panelWindow.hidden = YES;
+
     DYSettingsViewController *vc = [[DYSettingsViewController alloc] init];
+    vc.dismissCallback = ^{
+        self.panelWindow.hidden = NO;
+    };
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationFullScreen;
-    // 找到 topmost VC 来 present（从 UIApplication 拿最上层 VC）
+    // present 到 App 的 keyWindow（现在 panelWindow 隐藏了，App window 自动成为 key）
     UIViewController *top = [self topMostViewController];
-    if (top) [top presentViewController:nav animated:YES completion:nil];
+    if (top) {
+        [top presentViewController:nav animated:YES completion:nil];
+    } else {
+        // 兜底：present 失败也要恢复 panelWindow
+        self.panelWindow.hidden = NO;
+    }
 }
 
 - (UIViewController *)topMostViewController {
