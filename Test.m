@@ -1329,7 +1329,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 
         UILabel *lb = [[UILabel alloc] init];
         lb.text = title;
-        lb.font = [UIFont systemFontOfSize:15];
+        lb.font = [UIFont systemFontOfSize:17];
         lb.textColor = [UIColor labelColor];
         lb.textAlignment = NSTextAlignmentCenter;
         lb.numberOfLines = 1;
@@ -1422,8 +1422,8 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [self.clearButton.heightAnchor constraintEqualToConstant:44],
         [self.clearButton.widthAnchor constraintEqualToAnchor:self.saveButton.widthAnchor],
 
-        // logTextView 底部到底部按钮上方（最大高度 150pt，避免挤压按钮）
-        [self.logTextView.bottomAnchor constraintLessThanOrEqualToAnchor:self.saveButton.topAnchor constant:-10],
+        // logTextView 底部到底部按钮上方，最大高度 150pt
+        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
         [self.logTextView.heightAnchor constraintLessThanOrEqualToConstant:150],
     ]];
 
