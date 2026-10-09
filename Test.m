@@ -167,6 +167,25 @@ static BOOL gBypassEnabled = YES;
 // 全局总开关：关闭后所有日志不捕获、不显示，但 hook 仍在运行
 static BOOL gGlobalLogEnabled = YES;
 
+// 日志行数上限（用户自定义，默认 3000，持久化到 NSUserDefaults）
+static NSInteger gMaxLogLines = -1;
+static NSInteger DYGetMaxLogLines(void) {
+    if (gMaxLogLines < 0) {
+        NSNumber *saved = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYMaxLogLines"];
+        gMaxLogLines = saved ? saved.integerValue : 3000;
+        if (gMaxLogLines < 100) gMaxLogLines = 100;
+        if (gMaxLogLines > 50000) gMaxLogLines = 50000;
+    }
+    return gMaxLogLines;
+}
+static void DYSetMaxLogLines(NSInteger value) {
+    if (value < 100) value = 100;
+    if (value > 50000) value = 50000;
+    gMaxLogLines = value;
+    [[NSUserDefaults standardUserDefaults] setInteger:value forKey:@"DYMaxLogLines"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
 @interface DYLogManager : NSObject
 + (instancetype)sharedManager;
 // 追加一条日志（category：分类，如 "弹窗" / "文件IO"；message：详细内容）
@@ -1985,7 +2004,6 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     UISwitch *sw = (UISwitch *)cell.accessoryView;
     [sw removeTarget:nil action:nil forControlEvents:UIControlEventValueChanged];
 
-    NSInteger r = indexPath.row;
     if (s == 0) {
         if (r == 0) {
             cell.textLabel.text = @"全局总开关（日志捕获/显示）";
@@ -2541,27 +2559,6 @@ static BOOL DYShouldShowLine(NSString *line) {
         }
     }
     return YES;
-}
-
-// 日志显示/存储行数上限（用户可自定义，默认 3000，持久化到 NSUserDefaults）
-static NSInteger gMaxLogLines = -1; // -1 = 未初始化，首次访问时从 UserDefaults 读
-
-static NSInteger DYGetMaxLogLines(void) {
-    if (gMaxLogLines < 0) {
-        NSNumber *saved = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYMaxLogLines"];
-        gMaxLogLines = saved ? saved.integerValue : 3000;
-        if (gMaxLogLines < 100) gMaxLogLines = 100;     // 最小值 100
-        if (gMaxLogLines > 50000) gMaxLogLines = 50000;  // 最大值 50000
-    }
-    return gMaxLogLines;
-}
-
-static void DYSetMaxLogLines(NSInteger value) {
-    if (value < 100) value = 100;
-    if (value > 50000) value = 50000;
-    gMaxLogLines = value;
-    [[NSUserDefaults standardUserDefaults] setInteger:value forKey:@"DYMaxLogLines"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
 - (void)onLogUpdate:(NSNotification *)note {
