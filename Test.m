@@ -873,9 +873,20 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
 
 @implementation DYPanelWindow
 
+// 返回 panelView 本身，让 UIKit 沿子视图链正确做 hitTest，按钮才能点
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!self.panelView) return [super hitTest:point withEvent:event];
+    if (!self.panelView.userInteractionEnabled || self.panelView.hidden) return nil;
+    CGPoint localPoint = [self.panelView convertPoint:point fromView:self];
+    if ([self.panelView pointInside:localPoint withEvent:event]) {
+        return [self.panelView hitTest:localPoint withEvent:event] ?: self.panelView;
+    }
+    return nil;
+}
+
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
     if (!self.panelView) return NO;
-    CGPoint localPoint = [self.panelView convertPoint:point fromView:nil];
+    CGPoint localPoint = [self.panelView convertPoint:point fromView:self];
     return [self.panelView pointInside:localPoint withEvent:event];
 }
 
@@ -905,70 +916,83 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
 }
 
 - (void)setupUI {
-    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
-    self.layer.cornerRadius = 12.0;
-    self.layer.borderWidth = 1.0;
-    self.layer.borderColor = [[UIColor grayColor] colorWithAlphaComponent:0.5].CGColor;
-    self.clipsToBounds = YES;
+    // 纯白背景 + 圆角 + 细边框 + 阴影，接近系统 sheet / popover 风格
+    self.backgroundColor = [UIColor whiteColor];
+    self.layer.cornerRadius = 16.0;
+    self.layer.borderWidth = 0.5;
+    self.layer.borderColor = [UIColor colorWithWhite:0.88 alpha:1.0].CGColor;
+    self.clipsToBounds = NO;
+    self.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.layer.shadowOpacity = 0.18;
+    self.layer.shadowOffset = CGSizeMake(0, 4);
+    self.layer.shadowRadius = 16.0;
+    self.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.bounds cornerRadius:self.layer.cornerRadius].CGPath;
 
-    // 标题栏（长按此区域可拖动面板）
+    // 标题栏（用细分割线而不是色块，保持 iOS 原生质感）
     UIView *titleBar = [[UIView alloc] init];
-    titleBar.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.1];
+    titleBar.backgroundColor = [UIColor whiteColor];
     titleBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:titleBar];
 
+    UIView *titleSeparator = [[UIView alloc] init];
+    titleSeparator.backgroundColor = [UIColor colorWithWhite:0.9 alpha:1.0];
+    titleSeparator.translatesAutoresizingMaskIntoConstraints = NO;
+    [titleBar addSubview:titleSeparator];
+
+    // 青色标题
     UILabel *titleLabel = [[UILabel alloc] init];
     titleLabel.text = @"行为监控面板";
-    titleLabel.textColor = [UIColor whiteColor];
-    titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    titleLabel.textColor = [UIColor systemTealColor];
+    titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [titleBar addSubview:titleLabel];
 
-    // 关闭按钮
+    // 关闭按钮：原生系统按钮风格（SF Symbol 用文字兜底）
     self.closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.closeButton setTitle:@"✕" forState:UIControlStateNormal];
-    [self.closeButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.closeButton.titleLabel.font = [UIFont systemFontOfSize:16];
+    [self.closeButton setTitle:@"关闭" forState:UIControlStateNormal];
+    [self.closeButton setTitleColor:[UIColor systemGrayColor] forState:UIControlStateNormal];
+    self.closeButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
     self.closeButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.closeButton addTarget:self action:@selector(handleClose) forControlEvents:UIControlEventTouchUpInside];
     [titleBar addSubview:self.closeButton];
 
-    // 日志显示区（可滚动）
+    // 日志区：浅灰色字（系统 secondary label color）
     self.logTextView = [[UITextView alloc] init];
     self.logTextView.editable = NO;
     self.logTextView.scrollEnabled = YES;
-    self.logTextView.backgroundColor = [UIColor clearColor];
-    self.logTextView.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
+    self.logTextView.backgroundColor = [UIColor colorWithWhite:0.97 alpha:1.0];
+    self.logTextView.layer.cornerRadius = 8.0;
+    self.logTextView.layer.borderWidth = 0.5;
+    self.logTextView.layer.borderColor = [UIColor colorWithWhite:0.9 alpha:1.0].CGColor;
+    self.logTextView.textColor = [UIColor systemGray2Color];
     self.logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
+    self.logTextView.textContainerInset = UIEdgeInsetsMake(6, 6, 6, 6);
     self.logTextView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.logTextView];
 
-    // 保存按钮
+    // 保存按钮：原生 .tinted（system blue）
     self.saveButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.saveButton setTitle:@"保存日志" forState:UIControlStateNormal];
-    [self.saveButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.saveButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.5 blue:1.0 alpha:1.0];
-    self.saveButton.layer.cornerRadius = 6.0;
-    self.saveButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.saveButton.tintColor = [UIColor systemBlueColor];
+    self.saveButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     self.saveButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.saveButton addTarget:self action:@selector(handleSave) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.saveButton];
 
-    // 清空按钮
+    // 清空按钮：原生 tinted（system red）
     self.clearButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.clearButton setTitle:@"清空" forState:UIControlStateNormal];
-    [self.clearButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.clearButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:1.0];
-    self.clearButton.layer.cornerRadius = 6.0;
-    self.clearButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.clearButton.tintColor = [UIColor systemRedColor];
+    self.clearButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     self.clearButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.clearButton addTarget:self action:@selector(handleClear) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.clearButton];
 
-    // 抓包检测拦截开关按钮（默认开启，绿色=开，灰色=关）
+    // 抓包检测拦截开关按钮（原生风格 segmented-style）
     self.bypassToggleButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.bypassToggleButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    self.bypassToggleButton.layer.cornerRadius = 6.0;
+    self.bypassToggleButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.bypassToggleButton.layer.cornerRadius = 8.0;
+    self.bypassToggleButton.layer.borderWidth = 1.0;
     self.bypassToggleButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.bypassToggleButton addTarget:self action:@selector(handleBypassToggle) forControlEvents:UIControlEventTouchUpInside];
     [self updateBypassToggleAppearance];
@@ -980,46 +1004,51 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
         [titleBar.topAnchor constraintEqualToAnchor:self.topAnchor],
         [titleBar.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
         [titleBar.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
-        [titleBar.heightAnchor constraintEqualToConstant:36],
+        [titleBar.heightAnchor constraintEqualToConstant:44],
 
-        [titleLabel.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor constant:12],
+        [titleSeparator.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor],
+        [titleSeparator.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
+        [titleSeparator.bottomAnchor constraintEqualToAnchor:titleBar.bottomAnchor],
+        [titleSeparator.heightAnchor constraintEqualToConstant:0.5],
+
+        [titleLabel.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor constant:16],
         [titleLabel.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
 
         [self.closeButton.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor constant:-8],
         [self.closeButton.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
-        [self.closeButton.widthAnchor constraintEqualToConstant:32],
         [self.closeButton.heightAnchor constraintEqualToConstant:32],
+        [self.closeButton.widthAnchor constraintGreaterThanOrEqualToConstant:48],
 
         // logTextView
-        [self.logTextView.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:4],
-        [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:6],
-        [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-6],
-        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.bypassToggleButton.topAnchor constant:-6],
+        [self.logTextView.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:8],
+        [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+        [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.bypassToggleButton.topAnchor constant:-8],
 
-        // bypassToggleButton（抓包检测拦截开关，独占一行）
-        [self.bypassToggleButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:10],
-        [self.bypassToggleButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-10],
-        [self.bypassToggleButton.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-8],
-        [self.bypassToggleButton.heightAnchor constraintEqualToConstant:30],
+        // bypassToggleButton
+        [self.bypassToggleButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.bypassToggleButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [self.bypassToggleButton.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
+        [self.bypassToggleButton.heightAnchor constraintEqualToConstant:36],
 
         // saveButton
-        [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:10],
-        [self.saveButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-10],
-        [self.saveButton.heightAnchor constraintEqualToConstant:34],
-        [self.saveButton.trailingAnchor constraintEqualToAnchor:self.clearButton.leadingAnchor constant:-8],
+        [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
+        [self.saveButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
+        [self.saveButton.heightAnchor constraintEqualToConstant:44],
 
         // clearButton
-        [self.clearButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-10],
-        [self.clearButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-10],
-        [self.clearButton.heightAnchor constraintEqualToConstant:34],
-        [self.clearButton.widthAnchor constraintEqualToConstant:60],
-        [self.saveButton.widthAnchor constraintEqualToAnchor:self.clearButton.widthAnchor],
+        [self.clearButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
+        [self.clearButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
+        [self.clearButton.heightAnchor constraintEqualToConstant:44],
+
+        // 两个按钮在底部中间对齐：save 左，clear 右，自然分布
+        [self.saveButton.trailingAnchor constraintLessThanOrEqualToAnchor:self.clearButton.leadingAnchor constant:-8],
     ]];
 
     // 长按拖动手势（长按标题栏后可拖动整个面板，避免误触）
     self.longPressGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPressDrag:)];
-    self.longPressGesture.minimumPressDuration = 0.2; // 长按 0.2 秒触发
-    self.longPressGesture.allowableMovement = 15.0;   // 允许轻微移动
+    self.longPressGesture.minimumPressDuration = 0.35;
+    self.longPressGesture.allowableMovement = 15.0;
     self.longPressGesture.delegate = self;
     [titleBar addGestureRecognizer:self.longPressGesture];
 
@@ -1247,11 +1276,14 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
     NSString *title = [NSString stringWithFormat:@"拦截应用检测抓包：%@", gBypassEnabled ? @"开" : @"关"];
     [self.bypassToggleButton setTitle:title forState:UIControlStateNormal];
     if (gBypassEnabled) {
-        self.bypassToggleButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.6 blue:0.2 alpha:1.0];
+        self.bypassToggleButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.12];
+        self.bypassToggleButton.layer.borderColor = [UIColor systemGreenColor].CGColor;
+        [self.bypassToggleButton setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
     } else {
-        self.bypassToggleButton.backgroundColor = [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:1.0];
+        self.bypassToggleButton.backgroundColor = [UIColor colorWithWhite:0.95 alpha:1.0];
+        self.bypassToggleButton.layer.borderColor = [UIColor systemGrayColor].CGColor;
+        [self.bypassToggleButton setTitleColor:[UIColor systemGrayColor] forState:UIControlStateNormal];
     }
-    [self.bypassToggleButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
 }
 
 // 递归获取最顶层的 view controller
