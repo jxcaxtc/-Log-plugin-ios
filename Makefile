@@ -26,7 +26,7 @@ Test_FILES = Test.m fishhook.c
 Test_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
 # 链接框架（CommonCrypto 是系统 TBD 库，放 LIBRARIES 不是 FRAMEWORKS）
-Test_FRAMEWORKS = UIKit Foundation Network CFNetwork
+Test_FRAMEWORKS = UIKit Foundation Network CFNetwork Security
 # sqlite3 我们自己代码里要调 sqlite3_db_filename()，所以需要链；
 # CommonCrypto 只 hook 不调用，不需要链（App 进程本身会加载 libcommoncrypto）
 Test_LIBRARIES = sqlite3

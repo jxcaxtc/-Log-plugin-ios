@@ -86,6 +86,12 @@ static BOOL gDecryptMonitorEnabled = YES;
 // 全局开关：UI 日志过滤（YES 时面板只显示 category=="加密" 的密钥/明文类日志；NO 时显示全部）
 static BOOL gLogFilterKeyOnly = NO;
 
+// 全局开关：Keychain 访问监控（hook SecItemAdd/CopyMatching/Update/Delete）
+static BOOL gKeychainMonitorEnabled = YES;
+
+// 全局开关：UserDefaults 读写监控（hook objectForKey/setObject:forKey:）
+static BOOL gUserDefaultsMonitorEnabled = YES;
+
 // 搜索过滤：支持正则，nil / @"" 表示不过滤
 static NSString *gSearchPattern = nil;
 static BOOL gSearchIsRegex = NO;  // NO = 子串匹配，YES = 正则
@@ -1214,6 +1220,315 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
 @end
 
 // ============================================================================
+#pragma mark - Keychain 访问监控（SecItemAdd / SecItemCopyMatching / SecItemUpdate / SecItemDelete）
+// ============================================================================
+#import <Security/Security.h>
+
+typedef OSStatus (*DYSecItemFuncRef)(CFDictionaryRef query, CFTypeRef *result);
+typedef OSStatus (*DYSecItemCopyFuncRef)(CFDictionaryRef query, CFTypeRef *result);
+
+static DYSecItemFuncRef DYOrigSecItemAdd = NULL;
+static DYSecItemFuncRef DYOrigSecItemUpdate = NULL;
+static DYSecItemFuncRef DYOrigSecItemDelete = NULL;
+static DYSecItemCopyFuncRef DYOrigSecItemCopyMatching = NULL;
+
+static NSString *DYKeychainItemDescription(CFDictionaryRef query, CFTypeRef result) {
+    NSMutableString *out = [NSMutableString string];
+    NSDictionary *q = CFBridgingRelease(CFPropertyListCreateDeepCopy(kCFAllocatorDefault, query, kCFPropertyListMutableContainersAndLeaves));
+    if (q[@"acct"]) [out appendFormat:@"account=%@; ", q[@"acct"]];
+    if (q[@"svce"]) [out appendFormat:@"service=%@; ", q[@"svce"]];
+    if (q[@"clss"]) {
+        NSString *cls = (__bridge NSString *)q[@"clss"];
+        if ([cls isEqualToString:(__bridge NSString *)kSecClassGenericPassword]) cls = @"GenericPassword";
+        else if ([cls isEqualToString:(__bridge NSString *)kSecClassInternetPassword]) cls = @"InternetPassword";
+        else if ([cls isEqualToString:(__bridge NSString *)kSecClassCertificate]) cls = @"Certificate";
+        else if ([cls isEqualToString:(__bridge NSString *)kSecClassKey]) cls = @"Key";
+        else if ([cls isEqualToString:(__bridge NSString *)kSecClassIdentity]) cls = @"Identity";
+        [out appendFormat:@"class=%@; ", cls];
+    }
+    if (result) {
+        if (CFGetTypeID(result) == CFDataGetTypeID()) {
+            NSData *data = (__bridge NSData *)result;
+            NSString *ascii = DYAsciiFromBytes(data.bytes, data.length);
+            if (ascii.length > 0) [out appendFormat:@"value=%@; ", ascii];
+            else [out appendFormat:@"value(data, %lu bytes); ", (unsigned long)data.length];
+        } else if (CFGetTypeID(result) == CFStringGetTypeID()) {
+            [out appendFormat:@"value=%@; ", (__bridge NSString *)result];
+        } else if ([(__bridge id)result isKindOfClass:[NSArray class]]) {
+            [out appendFormat:@"result(count=%lu); ", (unsigned long)[(__bridge NSArray *)result count]];
+        }
+    }
+    if (out.length > 0) [out deleteCharactersInRange:NSMakeRange(out.length - 2, 2)];
+    return out;
+}
+
+static OSStatus DYHookedSecItemAdd(CFDictionaryRef query, CFTypeRef *result) {
+    OSStatus status = DYOrigSecItemAdd(query, result);
+    if (gKeychainMonitorEnabled) {
+        @autoreleasepool {
+            NSString *desc = DYKeychainItemDescription(query, status == 0 && result ? *result : NULL);
+            [[DYLogManager sharedManager] logWithCategory:@"Keychain"
+                message:[NSString stringWithFormat:@"写入 | status=%d | %@", status, desc]];
+        }
+    }
+    return status;
+}
+
+static OSStatus DYHookedSecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    OSStatus status = DYOrigSecItemCopyMatching(query, result);
+    if (gKeychainMonitorEnabled) {
+        @autoreleasepool {
+            NSString *desc = DYKeychainItemDescription(query, status == 0 && result ? *result : NULL);
+            [[DYLogManager sharedManager] logWithCategory:@"Keychain"
+                message:[NSString stringWithFormat:@"读取 | status=%d | %@", status, desc]];
+        }
+    }
+    return status;
+}
+
+static OSStatus DYHookedSecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    OSStatus status = DYOrigSecItemUpdate(query, attributesToUpdate);
+    if (gKeychainMonitorEnabled) {
+        @autoreleasepool {
+            NSString *desc = DYKeychainItemDescription(query, NULL);
+            [[DYLogManager sharedManager] logWithCategory:@"Keychain"
+                message:[NSString stringWithFormat:@"更新 | status=%d | %@", status, desc]];
+        }
+    }
+    return status;
+}
+
+static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
+    OSStatus status = DYOrigSecItemDelete(query);
+    if (gKeychainMonitorEnabled) {
+        @autoreleasepool {
+            NSString *desc = DYKeychainItemDescription(query, NULL);
+            [[DYLogManager sharedManager] logWithCategory:@"Keychain"
+                message:[NSString stringWithFormat:@"删除 | status=%d | %@", status, desc]];
+        }
+    }
+    return status;
+}
+
+@interface DYKeychainMonitor : NSObject <DYMonitor>
+@end
+@implementation DYKeychainMonitor
+- (void)startMonitoring {
+    struct rebind rebindings[] = {
+        { "SecItemAdd",          (void *)DYHookedSecItemAdd,          (void **)&DYOrigSecItemAdd },
+        { "SecItemCopyMatching", (void *)DYHookedSecItemCopyMatching, (void **)&DYOrigSecItemCopyMatching },
+        { "SecItemUpdate",       (void *)DYHookedSecItemUpdate,       (void **)&DYOrigSecItemUpdate },
+        { "SecItemDelete",       (void *)DYHookedSecItemDelete,       (void **)&DYOrigSecItemDelete },
+    };
+    rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:@"Keychain 访问监控已启动"];
+}
+- (void)stopMonitoring {}
+@end
+
+// ============================================================================
+#pragma mark - UserDefaults 读写监控（method swizzle）
+// ============================================================================
+@interface NSUserDefaults (DYSwizzle)
+@end
+
+@implementation NSUserDefaults (DYSwizzle)
+
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class cls = [NSUserDefaults class];
+        Method m;
+        m = class_getInstanceMethod(cls, @selector(objectForKey:));
+        if (m) method_exchangeImplementations(m, class_getInstanceMethod(cls, @selector(dy_swizzled_objectForKey:)));
+        m = class_getInstanceMethod(cls, @selector(setObject:forKey:));
+        if (m) method_exchangeImplementations(m, class_getInstanceMethod(cls, @selector(dy_swizzled_setObject:forKey:)));
+        m = class_getInstanceMethod(cls, @selector(removeObjectForKey:));
+        if (m) method_exchangeImplementations(m, class_getInstanceMethod(cls, @selector(dy_swizzled_removeObjectForKey:)));
+    });
+}
+
+- (id)dy_swizzled_objectForKey:(NSString *)defaultName {
+    id result = [self dy_swizzled_objectForKey:defaultName];
+    if (gUserDefaultsMonitorEnabled && defaultName) {
+        @autoreleasepool {
+            NSString *valDesc = @"(nil)";
+            if (result) {
+                if ([result isKindOfClass:[NSString class]]) valDesc = result;
+                else if ([result isKindOfClass:[NSNumber class]]) valDesc = [result stringValue];
+                else if ([result isKindOfClass:[NSData class]]) {
+                    NSString *ascii = DYAsciiFromBytes([result bytes], [result length]);
+                    valDesc = ascii.length > 0 ? ascii : [NSString stringWithFormat:@"NSData(%lu bytes)", (unsigned long)[result length]];
+                } else {
+                    valDesc = [NSString stringWithFormat:@"%@", result];
+                    if (valDesc.length > 200) valDesc = [[valDesc substringToIndex:200] stringByAppendingString:@"..."];
+                }
+            }
+            [[DYLogManager sharedManager] logWithCategory:@"UserDefaults"
+                message:[NSString stringWithFormat:@"读取 | key=%@ | value=%@", defaultName, valDesc]];
+        }
+    }
+    return result;
+}
+
+- (void)dy_swizzled_setObject:(id)value forKey:(NSString *)defaultName {
+    if (gUserDefaultsMonitorEnabled && defaultName) {
+        @autoreleasepool {
+            NSString *valDesc = @"(nil)";
+            if (value) {
+                if ([value isKindOfClass:[NSString class]]) valDesc = value;
+                else if ([value isKindOfClass:[NSNumber class]]) valDesc = [value stringValue];
+                else if ([value isKindOfClass:[NSData class]]) {
+                    NSString *ascii = DYAsciiFromBytes([value bytes], [value length]);
+                    valDesc = ascii.length > 0 ? ascii : [NSString stringWithFormat:@"NSData(%lu bytes)", (unsigned long)[value length]];
+                } else {
+                    valDesc = [NSString stringWithFormat:@"%@", value];
+                    if (valDesc.length > 200) valDesc = [[valDesc substringToIndex:200] stringByAppendingString:@"..."];
+                }
+            }
+            [[DYLogManager sharedManager] logWithCategory:@"UserDefaults"
+                message:[NSString stringWithFormat:@"写入 | key=%@ | value=%@", defaultName, valDesc]];
+        }
+    }
+    [self dy_swizzled_setObject:value forKey:defaultName];
+}
+
+- (void)dy_swizzled_removeObjectForKey:(NSString *)defaultName {
+    if (gUserDefaultsMonitorEnabled && defaultName) {
+        [[DYLogManager sharedManager] logWithCategory:@"UserDefaults"
+            message:[NSString stringWithFormat:@"删除 | key=%@", defaultName]];
+    }
+    [self dy_swizzled_removeObjectForKey:defaultName];
+}
+
+@end
+
+// ============================================================================
+#pragma mark - 设置全屏页（iOS Settings 原生风格，UITableViewStyleInsetGrouped）
+// ============================================================================
+@interface DYSettingsViewController : UITableViewController
+@end
+
+@implementation DYSettingsViewController {
+    // section 0: 三个核心开关
+}
+
+- (instancetype)init {
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"设置";
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.tableView.tableFooterView = [UIView new];
+    // 关闭按钮（右上角）
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成"
+                                                                             style:UIBarButtonItemStyleDone
+                                                                            target:self
+                                                                            action:@selector(handleDone)];
+}
+
+- (void)handleDone {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+#pragma mark - Table view data source
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    switch (section) {
+        case 0: return 3; // 拦截抓包 / 加密捕获 / 只看加密
+        case 1: return 2; // Keychain / UserDefaults
+        case 2: return 0;
+        default: return 0;
+    }
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    switch (section) {
+        case 0: return @"核心监控";
+        case 1: return @"额外监控";
+        default: return nil;
+    }
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *reuseId = @"DYSettingsCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseId];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseId];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        UISwitch *sw = [[UISwitch alloc] init];
+        cell.accessoryView = sw;
+    }
+    UISwitch *sw = (UISwitch *)cell.accessoryView;
+    [sw removeTarget:nil action:nil forControlEvents:UIControlEventValueChanged];
+
+    NSInteger s = indexPath.section, r = indexPath.row;
+    if (s == 0) {
+        if (r == 0) {
+            cell.textLabel.text = @"拦截应用检测抓包";
+            sw.on = gBypassEnabled;
+            [sw addTarget:self action:@selector(toggleBypass:) forControlEvents:UIControlEventValueChanged];
+        } else if (r == 1) {
+            cell.textLabel.text = @"捕获加密/哈希 密钥与明文";
+            sw.on = gDecryptMonitorEnabled;
+            [sw addTarget:self action:@selector(toggleDecrypt:) forControlEvents:UIControlEventValueChanged];
+        } else {
+            cell.textLabel.text = @"只显示密钥/加密日志";
+            sw.on = gLogFilterKeyOnly;
+            [sw addTarget:self action:@selector(toggleFilter:) forControlEvents:UIControlEventValueChanged];
+        }
+    } else if (s == 1) {
+        if (r == 0) {
+            cell.textLabel.text = @"Keychain 访问监控";
+            sw.on = gKeychainMonitorEnabled;
+            [sw addTarget:self action:@selector(toggleKeychain:) forControlEvents:UIControlEventValueChanged];
+        } else {
+            cell.textLabel.text = @"UserDefaults 读写监控";
+            sw.on = gUserDefaultsMonitorEnabled;
+            [sw addTarget:self action:@selector(toggleUserDefaults:) forControlEvents:UIControlEventValueChanged];
+        }
+    }
+    return cell;
+}
+
+- (void)toggleBypass:(UISwitch *)sw {
+    gBypassEnabled = sw.isOn;
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:[NSString stringWithFormat:@"拦截应用检测抓包已%@", sw.isOn ? @"开启" : @"关闭"]];
+}
+- (void)toggleDecrypt:(UISwitch *)sw {
+    gDecryptMonitorEnabled = sw.isOn;
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:[NSString stringWithFormat:@"加密/哈希 密钥与明文捕获已%@", sw.isOn ? @"开启" : @"关闭"]];
+}
+- (void)toggleFilter:(UISwitch *)sw {
+    gLogFilterKeyOnly = sw.isOn;
+    // 通知所有面板刷新过滤
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"DYForceApplyFilter" object:nil];
+}
+- (void)toggleKeychain:(UISwitch *)sw {
+    gKeychainMonitorEnabled = sw.isOn;
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:[NSString stringWithFormat:@"Keychain 访问监控已%@", sw.isOn ? @"开启" : @"关闭"]];
+}
+- (void)toggleUserDefaults:(UISwitch *)sw {
+    gUserDefaultsMonitorEnabled = sw.isOn;
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:[NSString stringWithFormat:@"UserDefaults 读写监控已%@", sw.isOn ? @"开启" : @"关闭"]];
+}
+
+@end
+
+// ============================================================================
+#pragma mark - 悬浮监控面板
+
+// ============================================================================
 #pragma mark - 悬浮监控面板
 // ============================================================================
 
@@ -1269,70 +1584,6 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     return self;
 }
 
-// 辅助：创建一个 iOS Settings 风格的行容器（左边 label + 右边 switch）
-- (UIView *)makeSwitchRowWithTitle:(NSString *)title
-                            target:(id)target
-                            action:(SEL)action
-                         switchOn:(BOOL)on
-                       dividerTop:(BOOL)divTop
-                    dividerBottom:(BOOL)divBottom {
-    UIView *row = [[UIView alloc] init];
-    row.backgroundColor = [UIColor whiteColor];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UILabel *label = [[UILabel alloc] init];
-    label.text = title;
-    // Settings 行标准字号 15pt，labelColor
-    label.font = [UIFont systemFontOfSize:15];
-    label.textColor = [UIColor labelColor];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    [row addSubview:label];
-
-    UISwitch *sw = [[UISwitch alloc] init];
-    sw.on = on;
-    // 不指定 onTintColor，用系统默认（iOS 原生绿色）
-    sw.translatesAutoresizingMaskIntoConstraints = NO;
-    [sw addTarget:target action:action forControlEvents:UIControlEventValueChanged];
-    [row addSubview:sw];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [label.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
-        [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [sw.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-16],
-        [sw.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [row.heightAnchor constraintEqualToConstant:44],
-    ]];
-
-    // 顶部分割线
-    if (divTop) {
-        UIView *topSep = [[UIView alloc] init];
-        topSep.backgroundColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-        topSep.translatesAutoresizingMaskIntoConstraints = NO;
-        [row addSubview:topSep];
-        [NSLayoutConstraint activateConstraints:@[
-            [topSep.topAnchor constraintEqualToAnchor:row.topAnchor],
-            [topSep.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
-            [topSep.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-            [topSep.heightAnchor constraintEqualToConstant:0.5],
-        ]];
-    }
-    // 底部分割线
-    if (divBottom) {
-        UIView *botSep = [[UIView alloc] init];
-        botSep.backgroundColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-        botSep.translatesAutoresizingMaskIntoConstraints = NO;
-        [row addSubview:botSep];
-        [NSLayoutConstraint activateConstraints:@[
-            [botSep.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
-            [botSep.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
-            [botSep.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-            [botSep.heightAnchor constraintEqualToConstant:0.5],
-        ]];
-    }
-
-    return row;
-}
-
 - (void)setupUI {
     // 整体：iOS Settings 风格卡片
     self.backgroundColor = [UIColor colorWithWhite:0.94 alpha:1.0]; // systemGroupedBackground
@@ -1371,57 +1622,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     searchBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:searchBar];
 
-    // 三个开关横向并排（放到 logTextView 之后创建）
-    UIStackView *switchStack = [[UIStackView alloc] init];
-    switchStack.axis = UILayoutConstraintAxisHorizontal;
-    switchStack.distribution = UIStackViewDistributionFillEqually;
-    switchStack.alignment = UIStackViewAlignmentTop;
-    switchStack.spacing = 8;
-    switchStack.translatesAutoresizingMaskIntoConstraints = NO;
-    // 整体缩小到 85%
-    switchStack.transform = CGAffineTransformMakeScale(0.85, 0.85);
-    [self addSubview:switchStack];
-
-    UIView * (^makeSwitch)(NSString *, SEL, BOOL) = ^(NSString *title, SEL action, BOOL on) {
-        UIView *col = [[UIView alloc] init];
-        col.translatesAutoresizingMaskIntoConstraints = NO;
-
-        UISwitch *sw = [[UISwitch alloc] init];
-        sw.on = on;
-        sw.translatesAutoresizingMaskIntoConstraints = NO;
-        [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
-        [col addSubview:sw];
-
-        UILabel *lb = [[UILabel alloc] init];
-        lb.text = title;
-        lb.font = [UIFont systemFontOfSize:17];
-        lb.textColor = [UIColor labelColor];
-        lb.textAlignment = NSTextAlignmentCenter;
-        lb.numberOfLines = 1;
-        lb.adjustsFontSizeToFitWidth = YES;
-        lb.minimumScaleFactor = 0.6;
-        lb.translatesAutoresizingMaskIntoConstraints = NO;
-        [col addSubview:lb];
-
-        [NSLayoutConstraint activateConstraints:@[
-            [sw.topAnchor constraintEqualToAnchor:col.topAnchor],
-            [sw.centerXAnchor constraintEqualToAnchor:col.centerXAnchor],
-            [lb.topAnchor constraintEqualToAnchor:sw.bottomAnchor constant:4],
-            [lb.leadingAnchor constraintEqualToAnchor:col.leadingAnchor],
-            [lb.trailingAnchor constraintEqualToAnchor:col.trailingAnchor],
-            [col.bottomAnchor constraintEqualToAnchor:lb.bottomAnchor],
-        ]];
-        return col;
-    };
-
-    UIView *col1 = makeSwitch(@"拦截抓包", @selector(handleBypassSwitch:), gBypassEnabled);
-    UIView *col2 = makeSwitch(@"加密捕获", @selector(handleDecryptSwitch:), gDecryptMonitorEnabled);
-    UIView *col3 = makeSwitch(@"只看加密", @selector(handleFilterSwitch:), gLogFilterKeyOnly);
-    [switchStack addArrangedSubview:col1];
-    [switchStack addArrangedSubview:col2];
-    [switchStack addArrangedSubview:col3];
-
-    // 日志区（全部系统默认：secondaryLabelColor + 系统字体）
+    // 日志区（全部系统默认：secondaryLabelColor + Menlo 11pt）
     self.logTextView = [[UITextView alloc] init];
     self.logTextView.editable = NO;
     self.logTextView.scrollEnabled = YES;
@@ -1452,6 +1653,14 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     [self.clearButton addTarget:self action:@selector(handleClear) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.clearButton];
 
+    // 设置按钮（titleBar 内，closeButton 左边）
+    UIButton *settingsButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [settingsButton setTitle:@"设置" forState:UIControlStateNormal];
+    settingsButton.titleLabel.font = [UIFont systemFontOfSize:15];
+    settingsButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [settingsButton addTarget:self action:@selector(handleSettings) forControlEvents:UIControlEventTouchUpInside];
+    [titleBar addSubview:settingsButton];
+
     // 外层 Auto Layout
     [NSLayoutConstraint activateConstraints:@[
         // titleBar
@@ -1463,24 +1672,24 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [titleLabel.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor],
         [titleLabel.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
 
+        // closeButton 最右
         [self.closeButton.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
         [self.closeButton.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
+
+        // settingsButton 在 closeButton 左边，间距 12
+        [settingsButton.trailingAnchor constraintEqualToAnchor:self.closeButton.leadingAnchor constant:-12],
+        [settingsButton.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
 
         // searchBar
         [searchBar.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:2],
         [searchBar.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
         [searchBar.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
 
-        // logTextView
+        // logTextView（撑满 searchBar → saveButton）
         [self.logTextView.topAnchor constraintEqualToAnchor:searchBar.bottomAnchor constant:4],
         [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
         [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
-
-        // switchStack（三个开关横排，logTextView 下方）
-        [switchStack.topAnchor constraintEqualToAnchor:self.logTextView.bottomAnchor constant:6],
-        [switchStack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
-        [switchStack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
-        [switchStack.heightAnchor constraintEqualToConstant:56],
+        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
 
         // saveButton / clearButton
         [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:24],
@@ -1491,12 +1700,6 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [self.clearButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
         [self.clearButton.heightAnchor constraintEqualToConstant:44],
         [self.clearButton.widthAnchor constraintEqualToAnchor:self.saveButton.widthAnchor],
-
-        // switchStack 底部 = saveButton 上方（== 锁死）
-        [switchStack.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-6],
-
-        // logTextView 底部 = switchStack 顶部 - 6（== 锁死，这样 log 区自动撑满 searchBar 和 switchStack 之间）
-        [self.logTextView.bottomAnchor constraintEqualToAnchor:switchStack.topAnchor constant:-6],
     ]];
 
     // 长按拖动
@@ -1511,6 +1714,38 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
                                              selector:@selector(onLogUpdate:)
                                                  name:DYLogDidUpdateNotification
                                                object:nil];
+    // 监听 "只看加密" 过滤开关变化（Settings 页切换）
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(applyLogFilter)
+                                                 name:@"DYForceApplyFilter"
+                                               object:nil];
+}
+
+// 打开全屏设置页
+- (void)handleSettings {
+    DYSettingsViewController *vc = [[DYSettingsViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    // 找到 topmost VC 来 present（从 UIApplication 拿最上层 VC）
+    UIViewController *top = [self topMostViewController];
+    if (top) [top presentViewController:nav animated:YES completion:nil];
+}
+
+- (UIViewController *)topMostViewController {
+    UIWindow *window = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) { window = w; break; }
+            }
+            if (!window && ws.windows.count > 0) window = ws.windows.firstObject;
+            if (window) break;
+        }
+    }
+    UIViewController *vc = window.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
 }
 
 // ---- UISearchBar 搜索（regex:... 前缀表示正则，否则子串） ----
@@ -1800,39 +2035,6 @@ static BOOL DYShouldShowLine(NSString *line) {
     [[DYLogManager sharedManager] clearLogs];
 }
 
-// 抓包检测拦截 —— UISwitch
-- (void)handleBypassSwitch:(UISwitch *)sender {
-    gBypassEnabled = sender.isOn;
-    [[DYLogManager sharedManager] logWithCategory:@"系统"
-        message:[NSString stringWithFormat:@"抓包检测拦截已%@", gBypassEnabled ? @"开启" : @"关闭"]];
-}
-
-// 加密/哈希 明文捕获 —— UISwitch
-- (void)handleDecryptSwitch:(UISwitch *)sender {
-    gDecryptMonitorEnabled = sender.isOn;
-    [[DYLogManager sharedManager] logWithCategory:@"系统"
-        message:[NSString stringWithFormat:@"加密/哈希 明文与密钥捕获已%@", gDecryptMonitorEnabled ? @"开启" : @"关闭"]];
-}
-
-// 只显示密钥/加密日志 —— UISwitch
-- (void)handleFilterSwitch:(UISwitch *)sender {
-    gLogFilterKeyOnly = sender.isOn;
-    [[DYLogManager sharedManager] logWithCategory:@"系统"
-        message:[NSString stringWithFormat:@"面板日志过滤：%@", gLogFilterKeyOnly ? @"只显示加密/密钥类" : @"显示全部"]];
-    [self applyLogFilter];
-}
-
-// 递归获取最顶层的 view controller
-- (UIViewController *)topMostViewController {
-    UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-    if (!rootVC) rootVC = [UIApplication sharedApplication].delegate.window.rootViewController;
-    UIViewController *topVC = rootVC;
-    while (topVC.presentedViewController) {
-        topVC = topVC.presentedViewController;
-    }
-    return topVC;
-}
-
 #pragma mark - UIDocumentPickerDelegate
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
@@ -1908,6 +2110,12 @@ static BOOL DYShouldShowLine(NSString *line) {
         // SQLite 数据库访问监控（无单独开关，直接进日志）
         DYDatabaseMonitor *databaseMonitor = [[DYDatabaseMonitor alloc] init];
         [databaseMonitor startMonitoring];
+
+        // Keychain 访问监控（SecItemAdd/CopyMatching/Update/Delete）
+        DYKeychainMonitor *keychainMonitor = [[DYKeychainMonitor alloc] init];
+        [keychainMonitor startMonitoring];
+
+        // UserDefaults 读写监控通过 +load swizzle 自动生效，无需手动注册
 
         // 后续新增监控模块在此处注册即可，例如：
         // DYNetworkMonitor *netMonitor = [[DYNetworkMonitor alloc] init];
