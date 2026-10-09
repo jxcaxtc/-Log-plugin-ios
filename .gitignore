@@ -3,6 +3,9 @@
 obj/
 *.deb
 
+# Logs
+*.log
+
 # macOS
 .DS_Store
 
