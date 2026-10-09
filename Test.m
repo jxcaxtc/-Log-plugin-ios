@@ -172,7 +172,9 @@ static BOOL gBypassEnabled = YES;
 
 @implementation DYLogManager {
     NSMutableArray<NSString *> *_logs;
-    dispatch_queue_t _queue; // 串行队列，保证线程安全
+    dispatch_queue_t _queue;        // 串行队列，保证线程安全
+    NSMutableArray<NSString *> *_pending; // 节流缓冲区
+    BOOL _flushScheduled;
 }
 
 + (instancetype)sharedManager {
@@ -188,6 +190,7 @@ static BOOL gBypassEnabled = YES;
     self = [super init];
     if (self) {
         _logs = [NSMutableArray array];
+        _pending = [NSMutableArray array];
         _queue = dispatch_queue_create("com.dymonitor.logqueue", DISPATCH_QUEUE_SERIAL);
     }
     return self;
@@ -195,27 +198,49 @@ static BOOL gBypassEnabled = YES;
 
 - (void)logWithCategory:(NSString *)category message:(NSString *)message {
     if (!message) return;
+    // 防止单条日志过长（比如大 SQL 或密文 hex 几百行）
+    NSString *trimmed = message.length > 5000 ? [[message substringToIndex:5000] stringByAppendingFormat:@"...(truncated from %lu chars)", (unsigned long)message.length] : message;
     NSString *line = [NSString stringWithFormat:@"[%@] [%@] %@",
-                      DYTimestampString(), category ?: @"未知", message];
-    // 同步到串行队列
+                      DYTimestampString(), category ?: @"未知", trimmed];
     dispatch_async(_queue, ^{
         @autoreleasepool {
             [self->_logs addObject:line];
-            // 限制最多保留 9000 条，避免内存无限增长
-            if (self->_logs.count > 9000) {
-                [self->_logs removeObjectsInRange:NSMakeRange(0, self->_logs.count - 5000)];
+            [self->_pending addObject:line];
+            // 总日志上限 5000 条，超过删前 1000 条（避免频繁内存重分配）
+            if (self->_logs.count > 5000) {
+                [self->_logs removeObjectsInRange:NSMakeRange(0, 1000)];
             }
-            NSString *copiedLine = [line copy];
-            // UI 刷新必须在主线程
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [[NSNotificationCenter defaultCenter] postNotificationName:DYLogDidUpdateNotification
-                                                                    object:nil
-                                                                  userInfo:@{@"line": copiedLine}];
-            });
+            // 节流：100ms 内攒一批，一次 flush 到主线程
+            if (!self->_flushScheduled) {
+                self->_flushScheduled = YES;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self flushPending];
+                });
+            }
         }
     });
-    // 同时输出到 NSLog，方便 Xcode / 设备控制台调试
+    // 同时输出到 NSLog（仅限调试开关打开时）
     DYLog(@"%@", line);
+}
+
+// 节流 flush：把 100ms 内攒的一批日志一次发出去
+- (void)flushPending {
+    // 切到 log 队列拿数据
+    dispatch_sync(_queue, ^{
+        if (self->_pending.count == 0) {
+            self->_flushScheduled = NO;
+            return;
+        }
+        NSArray *batch = [self->_pending copy];
+        [self->_pending removeAllObjects];
+        self->_flushScheduled = NO;
+        // 主线程一次性发通知，userInfo 带数组
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:DYLogDidUpdateNotification
+                                                                object:nil
+                                                              userInfo:@{@"batch": batch}];
+        });
+    });
 }
 
 - (NSArray<NSString *> *)allLogs {
@@ -229,6 +254,8 @@ static BOOL gBypassEnabled = YES;
 - (void)clearLogs {
     dispatch_async(_queue, ^{
         [self->_logs removeAllObjects];
+        [self->_pending removeAllObjects];
+        self->_flushScheduled = NO;
         dispatch_async(dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter] postNotificationName:DYLogDidUpdateNotification
                                                                 object:nil
@@ -1323,7 +1350,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     [self addSubview:titleBar];
 
     UILabel *titleLabel = [[UILabel alloc] init];
-    titleLabel.text = @"太平长安-应用助手";
+    titleLabel.text = @"太平长安-应用助手1.0";
     // 用系统默认 label 样式（导航栏大号加粗）
     titleLabel.textColor = [UIColor labelColor];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1527,17 +1554,46 @@ static BOOL DYShouldShowLine(NSString *line) {
     return YES;
 }
 
+// logTextView 显示上限：最多保留 2000 行（足够排查问题，又不会爆内存）
+#define DYMaxLogLinesInTextView 2000
+
 - (void)onLogUpdate:(NSNotification *)note {
     NSDictionary *userInfo = note.userInfo;
     if ([userInfo[@"clear"] boolValue]) { self.logTextView.text = @""; return; }
-    NSString *line = userInfo[@"line"];
-    if (!line) return;
-    if (!DYShouldShowLine(line)) return;
-    NSString *current = self.logTextView.text ?: @"";
-    NSString *newText = current.length > 0 ? [NSString stringWithFormat:@"%@\n%@", current, line] : line;
-    self.logTextView.text = newText;
-    NSRange bottom = NSMakeRange(newText.length - 1, 1);
-    [self.logTextView scrollRangeToVisible:bottom];
+    NSArray *batch = userInfo[@"batch"];
+    if (!batch || batch.count == 0) return;
+    NSMutableArray<NSString *> *visible = [NSMutableArray array];
+    for (NSString *line in batch) {
+        if (DYShouldShowLine(line)) [visible addObject:line];
+    }
+    if (visible.count == 0) return;
+
+    // 用 attributedString append 避免每次重拼全量（O(n²) → O(1)）
+    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithAttributedString:self.logTextView.attributedText];
+    NSDictionary *attrs = @{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor],
+                            NSFontAttributeName: [UIFont fontWithName:@"Menlo" size:11] };
+    for (NSUInteger i = 0; i < visible.count; i++) {
+        if (attr.length > 0) [attr appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"]];
+        [attr appendAttributedString:[[NSAttributedString alloc] initWithString:visible[i] attributes:attrs]];
+    }
+
+    // 行数保护：超过 2000 行，删顶部旧文本
+    NSString *full = attr.string;
+    NSUInteger lineCount = [[full componentsSeparatedByString:@"\n"] count];
+    if (lineCount > DYMaxLogLinesInTextView) {
+        NSArray *lines = [full componentsSeparatedByString:@"\n"];
+        NSArray *tail = [lines subarrayWithRange:NSMakeRange(lines.count - DYMaxLogLinesInTextView, DYMaxLogLinesInTextView)];
+        self.logTextView.text = [tail componentsJoinedByString:@"\n"];
+    } else {
+        self.logTextView.attributedText = attr;
+    }
+
+    // 滚到底部
+    NSString *finalText = self.logTextView.text ?: @"";
+    if (finalText.length > 0) {
+        NSRange bottom = NSMakeRange(finalText.length - 1, 1);
+        [self.logTextView scrollRangeToVisible:bottom];
+    }
 }
 
 // 根据当前过滤状态重刷（开关切换 / 搜索变化时调用）
@@ -1546,6 +1602,10 @@ static BOOL DYShouldShowLine(NSString *line) {
     NSMutableArray<NSString *> *visible = [NSMutableArray array];
     for (NSString *line in all) {
         if (DYShouldShowLine(line)) [visible addObject:line];
+    }
+    // UI 行数上限保护
+    if (visible.count > DYMaxLogLinesInTextView) {
+        visible = [[visible subarrayWithRange:NSMakeRange(visible.count - DYMaxLogLinesInTextView, DYMaxLogLinesInTextView)] mutableCopy];
     }
     self.logTextView.text = [visible componentsJoinedByString:@"\n"];
     if (visible.count > 0) {
