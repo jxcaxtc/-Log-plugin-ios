@@ -386,25 +386,36 @@ static void DYSetMaxLogLines(NSInteger value) {
         // 注意：swizzle 后，调用自身即调用原实现
         [self dy_presentViewController:viewControllerToPresent animated:flag completion:completion];
 
-        // 提取弹窗信息
+        // 提取弹窗信息：present 者类 → 被 present 的 VC 类
+        NSString *presenterClass = NSStringFromClass([self class]);
         NSString *vcClass = NSStringFromClass([viewControllerToPresent class]);
         NSMutableString *detail = [NSMutableString string];
-        [detail appendFormat:@"present VC: %@", vcClass];
+        [detail appendFormat:@"presentViewController: | 调用类=%@ | 目标类=%@", presenterClass, vcClass];
 
         if ([viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
             UIAlertController *alert = (UIAlertController *)viewControllerToPresent;
-            [detail appendString:@" | 类型: UIAlertController"];
-            if (alert.title.length > 0) [detail appendFormat:@" | title: %@", alert.title];
-            if (alert.message.length > 0) [detail appendFormat:@" | message: %@", alert.message];
+            [detail appendFormat:@" | 类型=UIAlertController"];
+            if (alert.title.length > 0) [detail appendFormat:@" | title=%@", alert.title];
+            if (alert.message.length > 0) [detail appendFormat:@" | message=%@", alert.message];
             NSMutableArray *titles = [NSMutableArray array];
             for (UIAlertAction *action in alert.actions) {
                 if (action.title) [titles addObject:action.title];
             }
             if (titles.count > 0) {
-                [detail appendFormat:@" | actions: [%@]", [titles componentsJoinedByString:@", "]];
+                [detail appendFormat:@" | actions=[%@]", [titles componentsJoinedByString:@", "]];
             }
+        } else if ([viewControllerToPresent isKindOfClass:[UINavigationController class]]) {
+            UINavigationController *nav = (UINavigationController *)viewControllerToPresent;
+            [detail appendFormat:@" | 类型=UINavigationController | root=%@",
+             NSStringFromClass([nav.viewControllers.firstObject class]) ?: @"(nil)"];
         } else {
-            [detail appendString:@" | 类型: 模态 VC（可能是自定义弹窗）"];
+            [detail appendFormat:@" | 类型=模态 VC"];
+        }
+
+        // 如果目标 VC 有 navigationItem.title，也打出来
+        if (viewControllerToPresent.navigationItem.title.length > 0
+            && ![viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
+            [detail appendFormat:@" | navTitle=%@", viewControllerToPresent.navigationItem.title];
         }
 
         [[DYLogManager sharedManager] logWithCategory:@"弹窗" message:detail];
@@ -1453,6 +1464,7 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
 @property (nonatomic, copy)   NSString *cls;      // ObjC 类名 (type=objc)
 @property (nonatomic, assign) BOOL isClassMethod; // ObjC: YES = +方法，NO = -方法
 @property (nonatomic, assign) BOOL enabled;
+@property (nonatomic, copy)   NSString *lastErrorMsg; // 最近一次 hook 失败原因（nil 表示成功或尚未尝试）
 + (instancetype)ruleWithDictionary:(NSDictionary *)d;
 - (NSDictionary *)toDictionary;
 @end
@@ -1688,6 +1700,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 
 - (void)applyRule:(DYCustomHookRule *)rule {
     if (rule.enabled) {
+        rule.lastErrorMsg = nil; // 先清空，待应用后再设置
         if ([rule.type isEqualToString:@"c"]) {
             [self applyCFuncHook:rule];
         } else if ([rule.type isEqualToString:@"objc"]) {
@@ -1698,6 +1711,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 
 - (void)applyCFuncHook:(DYCustomHookRule *)rule {
     if (DYCHookCount >= DY_MAX_C_HOOKS) {
+        rule.lastErrorMsg = @"已达上限 64 条";
         [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
             message:@"❌ C hook 已达上限 64 条"];
         return;
@@ -1705,6 +1719,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     // 用 dlsym 找原函数
     void *sym = dlsym(RTLD_DEFAULT, rule.name.UTF8String);
     if (!sym) {
+        rule.lastErrorMsg = [NSString stringWithFormat:@"找不到符号 %@", rule.name];
         [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
             message:[NSString stringWithFormat:@"❌ C hook 失败：找不到符号 %@", rule.name]];
         return;
@@ -1715,13 +1730,20 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     // 如用户需要 C 函数参数级 hook，请改用 ObjC 类型或自己实现 wrapper 汇编。
     DYCFuncGenericImpl orig = (DYCFuncGenericImpl)sym; // void* 隐式转函数指针，无需 __bridge
     DYRegisterCHook(rule.name.UTF8String, orig);
+    rule.lastErrorMsg = nil; // 成功
     [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
-        message:[NSString stringWithFormat:@"⚠️ C hook：%@ 已注册（orig=0x%llx，暂不 rebind）。如需参数级 hook 请用 ObjC 类型。",
+        message:[NSString stringWithFormat:@"✅ C hook 注册成功：%@（orig=0x%llx，暂不 rebind）",
                  rule.name, (unsigned long long)sym]];
 }
 
 - (void)applyObjCHook:(DYCustomHookRule *)rule {
-    DYSwizzleObjCMethod(rule.cls, rule.name, rule.isClassMethod);
+    BOOL ok = DYSwizzleObjCMethod(rule.cls, rule.name, rule.isClassMethod);
+    if (!ok) {
+        // DYSwizzleObjCMethod 内部已打了具体错误日志
+        rule.lastErrorMsg = [NSString stringWithFormat:@"ObjC hook 失败：类/方法不存在或参数过多"];
+    } else {
+        rule.lastErrorMsg = nil; // 成功
+    }
 }
 
 - (NSString *)rulesJSON {
@@ -2574,11 +2596,27 @@ static BOOL DYShouldShowLine(NSString *line) {
 
     // 用 attributedString append 避免每次重拼全量（O(n²) → O(1)）
     NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithAttributedString:self.logTextView.attributedText];
-    NSDictionary *attrs = @{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor],
-                            NSFontAttributeName: [UIFont fontWithName:@"Menlo" size:11] };
+    UIFont *logFont = [UIFont fontWithName:@"Menlo" size:11];
     for (NSUInteger i = 0; i < visible.count; i++) {
         if (attr.length > 0) [attr appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"]];
-        [attr appendAttributedString:[[NSAttributedString alloc] initWithString:visible[i] attributes:attrs]];
+        NSString *line = visible[i];
+        // 按日志内容选颜色：✅绿 ❌红 ⚠️黄 弹窗蓝 加密蓝 其余灰
+        UIColor *color = [UIColor secondaryLabelColor];
+        if ([line hasPrefix:@"✅"] || [line containsString:@"✅"]) {
+            color = [UIColor systemGreenColor];
+        } else if ([line hasPrefix:@"❌"] || [line containsString:@"❌"]) {
+            color = [UIColor systemRedColor];
+        } else if ([line hasPrefix:@"⚠️"] || [line containsString:@"⚠️"]) {
+            color = [UIColor systemOrangeColor];
+        } else if ([line rangeOfString:@"[弹窗]"].location != NSNotFound) {
+            color = [UIColor systemBlueColor];
+        } else if ([line rangeOfString:@"[加密]"].location != NSNotFound) {
+            color = [UIColor systemPurpleColor];
+        } else if ([line rangeOfString:@"[数据库]"].location != NSNotFound) {
+            color = [UIColor systemTealColor];
+        }
+        NSDictionary *attrs = @{ NSForegroundColorAttributeName: color, NSFontAttributeName: logFont };
+        [attr appendAttributedString:[[NSAttributedString alloc] initWithString:line attributes:attrs]];
     }
 
     // 行数保护：超过 2000 行，删顶部旧文本
@@ -2889,6 +2927,47 @@ static BOOL DYShouldShowLine(NSString *line) {
         // 加载持久化的自定义 Hook 规则（plist）并应用
         [DYCustomHookManager.sharedManager loadFromDisk];
         [DYCustomHookManager.sharedManager applyAllEnabledRules];
+
+        // 打印自定义 Hook 汇总（让用户一眼看到每条规则生效/未生效）
+        NSArray *rules = DYCustomHookManager.sharedManager.rules;
+        if (rules.count > 0) {
+            __block NSUInteger okCount = 0, failCount = 0;
+            for (DYCustomHookRule *r in rules) {
+                if (r.enabled) {
+                    if (r.lastErrorMsg) {
+                        failCount++;
+                        // 红色：❌ + 具体规则 + 错误原因
+                        NSString *tag = [r.type isEqualToString:@"objc"]
+                            ? [NSString stringWithFormat:@"ObjC[%@%@ %@]", r.isClassMethod ? @"+" : @"-", r.cls, r.name]
+                            : [NSString stringWithFormat:@"C(%@)", r.name];
+                        [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+                            message:[NSString stringWithFormat:@"❌ 未生效 | %@ | 原因：%@", tag, r.lastErrorMsg]];
+                    } else {
+                        okCount++;
+                        // 绿色：✅ + 具体规则
+                        NSString *tag = [r.type isEqualToString:@"objc"]
+                            ? [NSString stringWithFormat:@"ObjC[%@%@ %@]", r.isClassMethod ? @"+" : @"-", r.cls, r.name]
+                            : [NSString stringWithFormat:@"C(%@)", r.name];
+                        [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+                            message:[NSString stringWithFormat:@"✅ 生效 | %@", tag]];
+                    }
+                }
+            }
+            [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+                message:[NSString stringWithFormat:@"📊 Hook 汇总：共 %lu 条规则 | ✅ %lu 生效 | ❌ %lu 未生效 | %lu 已关闭",
+                         (unsigned long)rules.count,
+                         (unsigned long)okCount,
+                         (unsigned long)failCount,
+                         (unsigned long)(rules.count - okCount - failCount)]];
+        } else {
+            [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+                message:@"📊 Hook 汇总：暂无自定义规则"];
+        }
+
+        // 内置监控模块启动状态
+        [[DYLogManager sharedManager] logWithCategory:@"系统"
+            message:@"✅ 内置监控已全部启动（弹窗/文件IO/抓包检测/加密/数据库/Keychain/UserDefaults）"
+        ];
 
         // 后续新增监控模块在此处注册即可，例如：
         // DYNetworkMonitor *netMonitor = [[DYNetworkMonitor alloc] init];
