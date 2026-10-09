@@ -1554,8 +1554,8 @@ static BOOL DYShouldShowLine(NSString *line) {
     return YES;
 }
 
-// logTextView 显示上限：最多保留 2000 行（足够排查问题，又不会爆内存）
-#define DYMaxLogLinesInTextView 2000
+// logTextView 显示上限：最多保留 3000 行（足够排查问题，又不会爆内存）
+#define DYMaxLogLinesInTextView 3000
 
 - (void)onLogUpdate:(NSNotification *)note {
     NSDictionary *userInfo = note.userInfo;
