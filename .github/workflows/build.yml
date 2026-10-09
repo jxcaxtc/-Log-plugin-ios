@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Build libTest.dylib
+    name: Build Test.dylib
     runs-on: macos-latest
 
     steps:
@@ -48,8 +48,8 @@ jobs:
       - name: Upload dylib artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libTest.dylib
+          name: Test.dylib
           path: |
-            .theos/obj/debug/libTest.dylib
-            .theos/obj/libTest.dylib
+            .theos/obj/debug/Test.dylib
+            .theos/obj/Test.dylib
           if-no-files-found: warn
