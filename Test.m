@@ -330,7 +330,7 @@ static void DYSetMaxLogLines(NSInteger value) {
 
 @implementation DYAlertMonitor
 
-- (void)startMonitoring {
+    - (void)startMonitoring {
     @autoreleasepool {
         // 1) UIAlertController：拦截 presentViewController:animated:completion:
         Class alertVCClass = NSClassFromString(@"UIAlertController");
@@ -354,11 +354,16 @@ static void DYSetMaxLogLines(NSInteger value) {
                                     @selector(dy_showFromBarButtonItem:animated:));
         }
 
-        // 3) 自定义 UIView 弹窗：拦截 UIWindow 的 addSubview:，
-        //    通过类名启发式判断是否为弹窗类视图。
-        DYSwizzleInstanceMethod([UIWindow class],
+        // 3) 全局拦截 UIView.addSubview: —— 覆盖所有弹窗添加场景
+        //    包括加到 UIWindow 的、加到 VC.view 的、加到任意父视图的自定义弹窗
+        DYSwizzleInstanceMethod([UIView class],
                                 @selector(addSubview:),
                                 @selector(dy_addSubview:));
+
+        // 4) 拦截 UIWindow.makeKeyAndVisible —— 捕获 App 创建新 Window 展示弹窗的场景
+        DYSwizzleInstanceMethod([UIWindow class],
+                                @selector(makeKeyAndVisible),
+                                @selector(dy_makeKeyAndVisible));
     }
 }
 
@@ -463,66 +468,153 @@ static void DYSetMaxLogLines(NSInteger value) {
 @end
 
 // ----------------------------------------------------------------------------
-// UIWindow (DYAlertMonitor) —— 识别自定义 UIView 弹窗
+// UIView (DYAlertMonitor) —— 全局拦截 addSubview，识别自定义弹窗
+// 覆盖场景：加到 UIWindow、加到 VC.view、加到任意父视图的自定义弹窗
 // ----------------------------------------------------------------------------
-@interface UIWindow (DYAlertMonitor)
+@interface UIView (DYAlertMonitor)
 - (void)dy_addSubview:(UIView *)view;
 @end
 
-@implementation UIWindow (DYAlertMonitor)
+@implementation UIView (DYAlertMonitor)
 
-// 启发式：类名包含这些关键字的子视图，判定为"自定义 UIView 弹窗"
-static BOOL DYIsAlertLikeViewClass(Class cls) {
-    if (!cls) return NO;
-    NSString *name = NSStringFromClass(cls);
-    if (name.length == 0) return NO;
+// 提取弹窗文本内容（递归遍历 UILabel/UIButton/UITextView）
+static NSString *DYExtractPopupTexts(UIView *view) {
+    NSMutableArray *texts = [NSMutableArray array];
+    void (^visit)(UIView *) = ^(UIView *v) {
+        for (UIView *sub in v.subviews) {
+            if ([sub isKindOfClass:[UILabel class]]) {
+                NSString *t = ((UILabel *)sub).text;
+                if (t.length > 0) [texts addObject:t];
+            } else if ([sub isKindOfClass:[UIButton class]]) {
+                NSString *t = ((UIButton *)sub).titleLabel.text;
+                if (t.length > 0) [texts addObject:t];
+            } else if ([sub isKindOfClass:[UITextView class]]) {
+                NSString *t = ((UITextView *)sub).text;
+                if (t.length > 0) [texts addObject:t];
+            }
+            visit(sub);
+        }
+    };
+    visit(view);
+    return texts.count > 0 ? [texts componentsJoinedByString:@" | "] : @"(无)";
+}
+
+// 判断一个 view 是否"像弹窗"（满足任意两条以上）
+static BOOL DYIsLikelyPopupView(UIView *view, UIView *superview) {
+    if (!view || !superview) return NO;
+    NSString *clsName = NSStringFromClass([view class]);
+    if ([clsName hasPrefix:@"_"]) return NO; // 跳过系统私有类
+
+    // 条件 1：superview 是 UIWindow（顶层窗口上的视图很可能是弹窗）
+    BOOL onWindow = [superview isKindOfClass:[UIWindow class]];
+
+    // 条件 2：类名包含弹窗关键字
     NSArray<NSString *> *keywords = @[
         @"Alert", @"Popup", @"Dialog", @"Toast", @"HUD", @"Menu",
-        @"Sheet", @"Popover", @"Bubble", @"Tip", @"Notice",
+        @"Sheet", @"Popover", @"Bubble", @"Tip", @"Notice", @"Mask",
         @"alert", @"popup", @"dialog", @"toast", @"hud", @"menu",
-        @"sheet", @"popover"
+        @"sheet", @"popover", @"mask", @"Loading", @"loading",
+        @"Message", @"message", @"Confirm", @"confirm",
+        @"TipView", @"Warning", @"ErrorView"
     ];
+    BOOL nameMatch = NO;
     for (NSString *kw in keywords) {
-        if ([name containsString:kw]) return YES;
+        if ([clsName containsString:kw]) { nameMatch = YES; break; }
     }
-    // 遍历父类链
-    Class superCls = class_getSuperclass(cls);
-    if (superCls && superCls != [UIView class] && superCls != [NSObject class]) {
-        return DYIsAlertLikeViewClass(superCls);
+    if (!nameMatch) {
+        // 遍历父类链
+        Class superCls = class_getSuperclass([view class]);
+        while (superCls && superCls != [UIView class] && superCls != [NSObject class]) {
+            NSString *sname = NSStringFromClass(superCls);
+            for (NSString *kw in keywords) {
+                if ([sname containsString:kw]) { nameMatch = YES; break; }
+            }
+            if (nameMatch) break;
+            superCls = class_getSuperclass(superCls);
+        }
     }
-    return NO;
+
+    // 条件 3：面积 >= 屏幕 20%（小 Toast 可能不满足，但大弹窗肯定满足）
+    CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+    CGFloat minArea = screenW * screenH * 0.20;
+    CGFloat viewArea = view.bounds.size.width * view.bounds.size.height;
+    BOOL largeArea = viewArea >= minArea;
+
+    // 条件 4：layer.zPosition 很高（>= 999 通常是弹窗）
+    BOOL highZ = view.layer.zPosition >= 999;
+
+    // 条件 5：backgroundColor alpha < 1（有半透明遮罩）
+    BOOL hasMask = NO;
+    if (view.backgroundColor) {
+        CGFloat alpha = CGColorGetAlpha(view.backgroundColor.CGColor);
+        if (alpha < 1.0 && alpha > 0.0) hasMask = YES;
+    }
+
+    // 跳过常见系统容器类（导航栏、tab栏、滚动视图等）
+    NSArray *skipClasses = @[
+        @"UINavigationBar", @"UITabBar", @"UIToolbar", @"UISearchBar",
+        @"UIScrollView", @"UITableView", @"UICollectionView", @"UIStackView",
+        @"UIPageControl", @"UIActivityIndicatorView", @"UISwitch", @"UISlider",
+        @"UIProgressView", @"UISegmentedControl", @"UITextField", @"UITextView",
+        @"WKWebView", @"AVPlayerView", @"MKMapView", @"GMSMapView"
+    ];
+    for (NSString *sk in skipClasses) {
+        if ([clsName isEqualToString:sk]) return NO;
+    }
+
+    // 统计满足的条件数量
+    int score = 0;
+    if (onWindow) score++;
+    if (nameMatch) score++;
+    if (largeArea) score++;
+    if (highZ) score++;
+    if (hasMask) score++;
+
+    return score >= 2; // 至少满足两条才认为是弹窗
 }
 
 - (void)dy_addSubview:(UIView *)view {
     @autoreleasepool {
-        // 先调用原实现
+        // 先调用原实现（swizzle 后 dy_addSubview 就是原 addSubview）
         [self dy_addSubview:view];
 
-        // 过滤掉系统自身的视图（如 UIWindow 内的 UIStatusBar、UIRemoteView 等）
-        if (!view) return;
-        NSString *clsName = NSStringFromClass([view class]);
-        if ([clsName hasPrefix:@"_"]) return; // 跳过私有视图
+        // self 就是 superview，检查这个新加入的 view 是否像弹窗
+        if (DYIsLikelyPopupView(view, self)) {
+            NSString *clsName = NSStringFromClass([view class]);
+            NSString *superClsName = NSStringFromClass([self class]);
+            NSString *texts = DYExtractPopupTexts(view);
+            NSString *msg = [NSString stringWithFormat:
+                @"自定义弹窗 | 添加到=%@ | view类=%@ | zPosition=%.1f | 文本: %@",
+                superClsName, clsName, view.layer.zPosition, texts];
+            [[DYLogManager sharedManager] logWithCategory:@"弹窗" message:msg];
+        }
+    }
+}
 
-        if (DYIsAlertLikeViewClass([view class])) {
-            // 提取文本内容：遍历子视图，找出所有 UILabel / UITextView 的文本
-            NSMutableString *texts = [NSMutableString string];
-            for (UIView *sub in [view subviews]) {
-                if ([sub isKindOfClass:[UILabel class]]) {
-                    UILabel *lbl = (UILabel *)sub;
-                    if (lbl.text.length > 0) {
-                        if (texts.length > 0) [texts appendString:@" | "];
-                        [texts appendString:lbl.text];
-                    }
-                } else if ([sub isKindOfClass:[UITextView class]]) {
-                    UITextView *tv = (UITextView *)sub;
-                    if (tv.text.length > 0) {
-                        if (texts.length > 0) [texts appendString:@" | "];
-                        [texts appendString:tv.text];
-                    }
-                }
-            }
-            NSString *msg = [NSString stringWithFormat:@"自定义UIView弹窗: %@ | 文本: %@",
-                             clsName, texts.length > 0 ? texts : @"(无)"];
+@end
+
+// ----------------------------------------------------------------------------
+// UIWindow (DYAlertMonitor) —— 拦截 makeKeyAndVisible（捕获新 Window 弹窗）
+// ----------------------------------------------------------------------------
+@interface UIWindow (DYAlertMonitor_2)
+- (void)dy_makeKeyAndVisible;
+@end
+
+@implementation UIWindow (DYAlertMonitor_2)
+
+- (void)dy_makeKeyAndVisible {
+    @autoreleasepool {
+        [self dy_makeKeyAndVisible]; // 调原实现
+
+        // 如果是 app 自身创建的 Window（不是系统的），打日志
+        NSString *clsName = NSStringFromClass([self class]);
+        if (![clsName hasPrefix:@"_"] && self.windowLevel >= UIWindowLevelNormal) {
+            UIView *firstView = self.subviews.firstObject;
+            NSString *firstCls = firstView ? NSStringFromClass([firstView class]) : @"(无子视图)";
+            NSString *msg = [NSString stringWithFormat:
+                @"新Window成为KeyWindow | window类=%@ | windowLevel=%.0f | 第一子视图=%@",
+                clsName, self.windowLevel, firstCls];
             [[DYLogManager sharedManager] logWithCategory:@"弹窗" message:msg];
         }
     }
