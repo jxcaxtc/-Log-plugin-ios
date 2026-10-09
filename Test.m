@@ -172,8 +172,7 @@ static void (*gOrig_Exit)(int) = NULL;
 
 static void DYPatchedExit(int code) {
     if (gAntiCrashEnabled) {
-        [[DYLogManager sharedManager] logWithCategory:@"防崩溃"
-            message:[NSString stringWithFormat:@"⚠️ 拦截 exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code]];
+        NSLog(@"[应用助手] ⚠️ 拦截 exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code);
         return; // 直接吞掉，不退出
     }
     if (gOrigExit) gOrigExit(code);
@@ -181,8 +180,7 @@ static void DYPatchedExit(int code) {
 }
 static void DYPatched_Exit(int code) {
     if (gAntiCrashEnabled) {
-        [[DYLogManager sharedManager] logWithCategory:@"防崩溃"
-            message:[NSString stringWithFormat:@"⚠️ 拦截 _Exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code]];
+        NSLog(@"[应用助手] ⚠️ 拦截 _Exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code);
         return;
     }
     if (gOrig_Exit) gOrig_Exit(code);
@@ -191,9 +189,9 @@ static void DYPatched_Exit(int code) {
 static void DYPatchedAbort(void) {
     if (gAntiCrashEnabled) {
         // 打印调用栈帮助定位是哪段代码触发的 abort
-        NSString *stack = [NSThread callStackSymbols].componentsJoinedByString:@"\n    "];
-        [[DYLogManager sharedManager] logWithCategory:@"防崩溃"
-            message:[NSString stringWithFormat:@"⚠️ 拦截 abort() —— 疑似 VPN/环境检测触发。调用栈:\n    %@", stack ?: @"(空)"]];
+        NSArray *syms = [NSThread callStackSymbols];
+        NSString *stack = [syms componentsJoinedByString:@"\n    "];
+        NSLog(@"[应用助手] ⚠️ 拦截 abort() —— 疑似 VPN/环境检测触发。调用栈:\n    %@", stack ?: @"(空)");
         return; // 吞掉，不崩溃
     }
     if (gOrigAbort) gOrigAbort();
@@ -3067,7 +3065,7 @@ static BOOL DYShouldShowLine(NSString *line) {
 
         // 防崩溃：hook exit / abort / _Exit，拦截 VPN/环境检测触发的主动闪退
         if (gAntiCrashEnabled) {
-            struct rebind crashRebinds[] = {
+            struct rebinding crashRebinds[] = {
                 { "exit",    (void *)&DYPatchedExit,    (void **)&gOrigExit },
                 { "_Exit",   (void *)&DYPatched_Exit,   (void **)&gOrig_Exit },
                 { "abort",   (void *)&DYPatchedAbort,   (void **)&gOrigAbort },
