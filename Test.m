@@ -1306,53 +1306,55 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
     [self.closeButton addTarget:self action:@selector(handleClose) forControlEvents:UIControlEventTouchUpInside];
     [titleBar addSubview:self.closeButton];
 
-    // iOS Settings 风格 section（圆角白底 + 内部分割线）
-    self.settingsSection = [[UIView alloc] init];
-    self.settingsSection.backgroundColor = [UIColor whiteColor];
-    self.settingsSection.layer.cornerRadius = 10.0;
-    self.settingsSection.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
-                                               kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
-    self.settingsSection.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:self.settingsSection];
+    // 三个开关横向并排：每个都是 switch 在上、小字号 label 在下，整体缩小 0.85x
+    UIStackView *switchStack = [[UIStackView alloc] init];
+    switchStack.axis = UILayoutConstraintAxisHorizontal;
+    switchStack.distribution = UIStackViewDistributionFillEqually;
+    switchStack.alignment = UIStackViewAlignmentTop;
+    switchStack.spacing = 8;
+    switchStack.translatesAutoresizingMaskIntoConstraints = NO;
+    // 整体缩小到 85%
+    switchStack.transform = CGAffineTransformMakeScale(0.85, 0.85);
+    [self addSubview:switchStack];
 
-    // 3 个开关行（Settings 风格，文字尽量简短）
-    UIView *row1 = [self makeSwitchRowWithTitle:@"过抓包检测"
-                                         target:self
-                                         action:@selector(handleBypassSwitch:)
-                                       switchOn:gBypassEnabled
-                                     dividerTop:YES
-                                  dividerBottom:NO];
-    UIView *row2 = [self makeSwitchRowWithTitle:@"捕获密钥"
-                                         target:self
-                                         action:@selector(handleDecryptSwitch:)
-                                       switchOn:gDecryptMonitorEnabled
-                                     dividerTop:NO
-                                  dividerBottom:NO];
-    UIView *row3 = [self makeSwitchRowWithTitle:@"只看加密"
-                                         target:self
-                                         action:@selector(handleFilterSwitch:)
-                                       switchOn:gLogFilterKeyOnly
-                                     dividerTop:NO
-                                  dividerBottom:YES];
-    [self.settingsSection addSubview:row1];
-    [self.settingsSection addSubview:row2];
-    [self.settingsSection addSubview:row3];
+    UIView * (^makeSwitch)(NSString *, SEL, BOOL) = ^(NSString *title, SEL action, BOOL on) {
+        UIView *col = [[UIView alloc] init];
+        col.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // Auto Layout: section 内部垂直堆叠，section 外层约束
-    [NSLayoutConstraint activateConstraints:@[
-        [row1.topAnchor constraintEqualToAnchor:self.settingsSection.topAnchor],
-        [row1.leadingAnchor constraintEqualToAnchor:self.settingsSection.leadingAnchor],
-        [row1.trailingAnchor constraintEqualToAnchor:self.settingsSection.trailingAnchor],
+        UISwitch *sw = [[UISwitch alloc] init];
+        sw.on = on;
+        sw.translatesAutoresizingMaskIntoConstraints = NO;
+        [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+        [col addSubview:sw];
 
-        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor],
-        [row2.leadingAnchor constraintEqualToAnchor:self.settingsSection.leadingAnchor],
-        [row2.trailingAnchor constraintEqualToAnchor:self.settingsSection.trailingAnchor],
+        UILabel *lb = [[UILabel alloc] init];
+        lb.text = title;
+        lb.font = [UIFont systemFontOfSize:12];
+        lb.textColor = [UIColor labelColor];
+        lb.textAlignment = NSTextAlignmentCenter;
+        lb.numberOfLines = 1;
+        lb.adjustsFontSizeToFitWidth = YES;
+        lb.minimumScaleFactor = 0.6;
+        lb.translatesAutoresizingMaskIntoConstraints = NO;
+        [col addSubview:lb];
 
-        [row3.topAnchor constraintEqualToAnchor:row2.bottomAnchor],
-        [row3.leadingAnchor constraintEqualToAnchor:self.settingsSection.leadingAnchor],
-        [row3.trailingAnchor constraintEqualToAnchor:self.settingsSection.trailingAnchor],
-        [row3.bottomAnchor constraintEqualToAnchor:self.settingsSection.bottomAnchor],
-    ]];
+        [NSLayoutConstraint activateConstraints:@[
+            [sw.topAnchor constraintEqualToAnchor:col.topAnchor],
+            [sw.centerXAnchor constraintEqualToAnchor:col.centerXAnchor],
+            [lb.topAnchor constraintEqualToAnchor:sw.bottomAnchor constant:4],
+            [lb.leadingAnchor constraintEqualToAnchor:col.leadingAnchor],
+            [lb.trailingAnchor constraintEqualToAnchor:col.trailingAnchor],
+            [col.bottomAnchor constraintEqualToAnchor:lb.bottomAnchor],
+        ]];
+        return col;
+    };
+
+    UIView *col1 = makeSwitch(@"拦截抓包", @selector(handleBypassSwitch:), gBypassEnabled);
+    UIView *col2 = makeSwitch(@"加密捕获", @selector(handleDecryptSwitch:), gDecryptMonitorEnabled);
+    UIView *col3 = makeSwitch(@"只看加密", @selector(handleFilterSwitch:), gLogFilterKeyOnly);
+    [switchStack addArrangedSubview:col1];
+    [switchStack addArrangedSubview:col2];
+    [switchStack addArrangedSubview:col3];
 
     // 日志区（全部系统默认：secondaryLabelColor + 系统字体）
     self.logTextView = [[UITextView alloc] init];
@@ -1399,13 +1401,14 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [self.closeButton.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
         [self.closeButton.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
 
-        // settings section
-        [self.settingsSection.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:10],
-        [self.settingsSection.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.settingsSection.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        // switchStack（三个开关横排，缩小 0.85x）
+        [switchStack.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:4],
+        [switchStack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+        [switchStack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+        [switchStack.heightAnchor constraintEqualToConstant:40],
 
         // logTextView
-        [self.logTextView.topAnchor constraintEqualToAnchor:self.settingsSection.bottomAnchor constant:10],
+        [self.logTextView.topAnchor constraintEqualToAnchor:switchStack.bottomAnchor constant:8],
         [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
         [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
 
