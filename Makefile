@@ -27,8 +27,9 @@ Test_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
 # 链接框架（CommonCrypto 是系统 TBD 库，放 LIBRARIES 不是 FRAMEWORKS）
 Test_FRAMEWORKS = UIKit Foundation Network CFNetwork
-# sqlite3 + CommonCrypto 都是 lib*.tbd，作为系统库链接
-Test_LIBRARIES = sqlite3 commoncrypto
+# sqlite3 我们自己代码里要调 sqlite3_db_filename()，所以需要链；
+# CommonCrypto 只 hook 不调用，不需要链（App 进程本身会加载 libcommoncrypto）
+Test_LIBRARIES = sqlite3
 
 # -lobjc 是 Theos 默认链接的，不用重复指定
 
