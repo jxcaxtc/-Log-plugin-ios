@@ -1453,7 +1453,7 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
     switch (section) {
         case 0: return 3; // 拦截抓包 / 加密捕获 / 只看加密
         case 1: return 2; // Keychain / UserDefaults
-        case 2: return 0;
+        case 2: return 1; // 关于应用
         default: return 0;
     }
 }
@@ -1462,11 +1462,27 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
     switch (section) {
         case 0: return @"核心监控";
         case 1: return @"额外监控";
+        case 2: return @"其他";
         default: return nil;
     }
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSInteger s = indexPath.section;
+    // section 2 单独处理（about 行，用默认 cell 样式但加箭头）
+    if (s == 2) {
+        static NSString *aboutId = @"DYAboutCell";
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:aboutId];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:aboutId];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        }
+        cell.textLabel.text = @"关于应用";
+        cell.detailTextLabel.text = @"v2.0";
+        return cell;
+    }
+
     static NSString *reuseId = @"DYSettingsCell";
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseId];
     if (!cell) {
@@ -1478,7 +1494,7 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
     UISwitch *sw = (UISwitch *)cell.accessoryView;
     [sw removeTarget:nil action:nil forControlEvents:UIControlEventValueChanged];
 
-    NSInteger s = indexPath.section, r = indexPath.row;
+    NSInteger r = indexPath.row;
     if (s == 0) {
         if (r == 0) {
             cell.textLabel.text = @"拦截应用检测抓包";
@@ -1531,6 +1547,73 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
     gUserDefaultsMonitorEnabled = sw.isOn;
     [[DYLogManager sharedManager] logWithCategory:@"系统"
         message:[NSString stringWithFormat:@"UserDefaults 读写监控已%@", sw.isOn ? @"开启" : @"关闭"]];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 2 && indexPath.row == 0) {
+        [self showAboutSheet];
+    }
+}
+
+// "关于应用"半屏 sheet（UISheetPresentationController detents 固定半屏）
+- (void)showAboutSheet {
+    UIViewController *about = [[UIViewController alloc] init];
+    about.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    about.title = @"关于应用";
+
+    // 关闭按钮（sheet 顶部）
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    [close setTitle:@"完成" forState:UIControlStateNormal];
+    close.translatesAutoresizingMaskIntoConstraints = NO;
+    [close addTarget:self action:@selector(dismissAboutSheet:) forControlEvents:UIControlEventTouchUpInside];
+    [about.view addSubview:close];
+    [NSLayoutConstraint activateConstraints:@[
+        [close.trailingAnchor constraintEqualToAnchor:about.view.trailingAnchor constant:-16],
+        [close.topAnchor constraintEqualToAnchor:about.view.safeAreaLayoutGuide.topAnchor constant:8],
+    ]];
+
+    // 内容标签（关于应用说明）
+    UILabel *content = [[UILabel alloc] init];
+    content.numberOfLines = 0;
+    content.textColor = [UIColor labelColor];
+    content.font = [UIFont systemFontOfSize:15];
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    [about.view addSubview:content];
+
+    NSString *bundleVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"1.0";
+    content.text = [NSString stringWithFormat:
+        @"太平长安-应用助手\n"
+        @"版本 v2.0（构建 %@）\n\n"
+        @"一款 iOS 进程内行为监控插件，支持：\n"
+        @"• 拦截应用检测抓包（VPN / Proxy / VPN 配置）\n"
+        @"• 捕获 AES / MD5 / SHA 等加密密钥与明文\n"
+        @"• SQLite 数据库访问监控\n"
+        @"• Keychain 账号密码读写监控\n"
+        @"• UserDefaults 配置读写监控\n\n"
+        @"注入方式：通过 libhooker / Substrate 等\n"
+        @"目标系统：iOS 17.0+\n\n"
+        @"Powered by fishhook", bundleVer];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [content.topAnchor constraintEqualToAnchor:about.view.safeAreaLayoutGuide.topAnchor constant:40],
+        [content.leadingAnchor constraintEqualToAnchor:about.view.leadingAnchor constant:20],
+        [content.trailingAnchor constraintEqualToAnchor:about.view.trailingAnchor constant:-20],
+    ]];
+
+    // 半屏 sheet
+    about.modalPresentationStyle = UIModalPresentationPageSheet;
+    if (@available(iOS 15.0, *)) {
+        UISheetPresentationController *sheet = about.sheetPresentationController;
+        sheet.detents = @[ [UISheetPresentationControllerDetent largeDetent] ]; // 半屏到全屏
+        sheet.prefersScrollingExpandsWhenScrolledToEdge = NO;
+        sheet.prefersEdgeAttachedInCompactHeight = YES;
+    }
+    [self presentViewController:about animated:YES completion:nil];
+}
+
+- (void)dismissAboutSheet:(UIButton *)sender {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 @end
@@ -1611,7 +1694,7 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
     [self addSubview:titleBar];
 
     UILabel *titleLabel = [[UILabel alloc] init];
-    titleLabel.text = @"太平长安-应用助手1.0";
+    titleLabel.text = @"太平长安-应用助手2.0";
     // 用系统默认 label 样式（导航栏大号加粗）
     titleLabel.textColor = [UIColor labelColor];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
