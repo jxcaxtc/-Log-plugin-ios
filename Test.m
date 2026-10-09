@@ -1463,12 +1463,6 @@ static const char *DYCHookNames[DY_MAX_C_HOOKS];
 static DYCFuncGenericImpl DYCHookOrigs[DY_MAX_C_HOOKS];
 static int DYCHookCount = 0;
 
-// DYCustomHookManager forward（下面真正 @interface 之后再写）
-@interface DYCustomHookManager : NSObject
-+ (instancetype)sharedManager;
-@property (nonatomic, assign) BOOL objcHookEnabled;
-@end
-
 static BOOL DYRegisterCHook(const char *name, DYCFuncGenericImpl orig) {
     if (DYCHookCount >= DY_MAX_C_HOOKS) return NO;
     DYCHookNames[DYCHookCount] = name;
@@ -1538,11 +1532,9 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     switch (argCount) {
         case 2: { // -method / +method （0 参数）
             id (^block)(id, SEL) = ^id(id self, SEL _cmd) {
-                if (DYCustomHookManager.sharedManager.objcHookEnabled) {
-                    [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
-                        message:[NSString stringWithFormat:@"[ObjC] %@[%@ %@]",
-                                 isClassMethod ? @"+" : @"-", clsName, selName]];
-                }
+                [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+                    message:[NSString stringWithFormat:@"[ObjC] %@[%@ %@]",
+                             isClassMethod ? @"+" : @"-", clsName, selName]];
                 return ((id(*)(id, SEL))origImp)(self, _cmd);
             };
             newImp = imp_implementationWithBlock(block);
@@ -1550,11 +1542,9 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         }
         case 3: { // -method: / +method: （1 参数）
             id (^block)(id, SEL, id) = ^id(id self, SEL _cmd, id a) {
-                if (DYCustomHookManager.sharedManager.objcHookEnabled) {
-                    [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
-                        message:[NSString stringWithFormat:@"[ObjC] %@[%@ %@ %@]",
-                                 isClassMethod ? @"+" : @"-", clsName, selName, a ?: @"(nil)"]];
-                }
+                [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+                    message:[NSString stringWithFormat:@"[ObjC] %@[%@ %@ %@]",
+                             isClassMethod ? @"+" : @"-", clsName, selName, a ?: @"(nil)"]];
                 return ((id(*)(id, SEL, id))origImp)(self, _cmd, a);
             };
             newImp = imp_implementationWithBlock(block);
@@ -1562,11 +1552,9 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         }
         case 4: { // 2 参数
             id (^block)(id, SEL, id, id) = ^id(id self, SEL _cmd, id a, id b) {
-                if (DYCustomHookManager.sharedManager.objcHookEnabled) {
-                    [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
-                        message:[NSString stringWithFormat:@"[ObjC] %@[%@ %@ %@ %@]",
-                                 isClassMethod ? @"+" : @"-", clsName, selName, a ?: @"(nil)", b ?: @"(nil)"]];
-                }
+                [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+                    message:[NSString stringWithFormat:@"[ObjC] %@[%@ %@ %@ %@]",
+                             isClassMethod ? @"+" : @"-", clsName, selName, a ?: @"(nil)", b ?: @"(nil)"]];
                 return ((id(*)(id, SEL, id, id))origImp)(self, _cmd, a, b);
             };
             newImp = imp_implementationWithBlock(block);
