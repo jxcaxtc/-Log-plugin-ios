@@ -848,6 +848,13 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
 }
 
 // ----------------------------------------------------------------------------
+// NWPath / NWParameters 空 interface stub（Network.framework 未公开完整头，
+// 但运行时类存在；此处仅为满足编译器对 category 的类型检查）
+// ----------------------------------------------------------------------------
+@interface NWPath : NSObject @end
+@interface NWParameters : NSObject @end
+
+// ----------------------------------------------------------------------------
 // NWPath (DYBypass) —— usesVirtualInterface getter 篡改
 // ----------------------------------------------------------------------------
 @interface NWPath (DYBypass_NWPath)
@@ -1114,7 +1121,7 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
         [self.clearButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-10],
         [self.clearButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-10],
         [self.clearButton.heightAnchor constraintEqualToConstant:34],
-        [self.clearButton.widthAnchor constraintEqualToAnchor:60],
+        [self.clearButton.widthAnchor constraintEqualToConstant:60],
         [self.saveButton.widthAnchor constraintEqualToAnchor:self.clearButton.widthAnchor],
     ]];
 
