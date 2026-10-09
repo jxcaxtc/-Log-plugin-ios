@@ -1451,65 +1451,26 @@ static OSStatus DYHookedSecItemDelete(CFDictionaryRef query) {
 // ============================================================================
 #pragma mark - 通用 C 函数 Hook（fishhook + 可变参数通用 dump）
 // ============================================================================
-// 通用 C 函数 hook 器：保存一条 hook 信息，调用原函数前后把参数 dump 出来
-// 注意：不解析参数类型，只按寄存器/栈顺序 dump 原始值（32 位/64 位分别处理）
+// 通用 C 函数 hook 方案：
+// ARC 下 ObjC 容器不能存 C 函数指针，所以用 C 数组存 hook 元信息
 
-struct DYCFunctionHook {
-    const char *name;
-    void *origPtr;     // 原函数指针
-    void *hookPtr;     // hook 函数指针（DYCFuncHook）
-};
+typedef void *(*DYCFuncGenericImpl)(void *, void *, void *, void *,
+                                     void *, void *, void *, void *);
 
-// 通用 hook block 签名：返回 void，入参 char *name + void *retPtr
-typedef void (*DYCFuncHook)(void);
+// C 数组存每个 C hook 的（name, origFunc）
+#define DY_MAX_C_HOOKS 64
+static const char *DYCHookNames[DY_MAX_C_HOOKS];
+static DYCFuncGenericImpl DYCHookOrigs[DY_MAX_C_HOOKS];
+static int DYCHookCount = 0;
 
-// 每条动态 hook 的元信息（全局数组）
-static NSMutableArray<NSDictionary *> *DYCustomCHookInfoList = nil;
+// DYCustomHookManager forward（下面真正 @interface 之后再写）
 
-// 通用 C 函数 hook 实现：用 __attribute__((naked)) + 汇编 或者 objc_msgSend 转发
-// 简化方案：针对 fishhook rebind 后的函数，我们用一个 wrapper 来 dump 参数
-// 但更简单的做法是：让用户直接在 block 里处理
-//
-// 实际可用的简化实现：对于 C 函数，我们用 fishhook 把它 rebind 到一个通用的 hook 函数，
-// 然后 hook 函数内部再调原函数。但问题是 C 函数参数签名未知。
-//
-// 务实方案：C 函数 hook 只能 dump 有限的寄存器（arm64 前 8 个参数在 x0-x7，之后在栈上）
-// 我们写一个通用的 arm64 hook stub：
-
-typedef void *(*DYCFuncGenericImpl)(void *arg0, void *arg1, void *arg2, void *arg3,
-                                     void *arg4, void *arg5, void *arg6, void *arg7);
-
-static NSMutableDictionary<NSString *, DYCFuncGenericImpl> *DYOrigCFuncTable = nil;
-
-static DYCFuncGenericImpl DYMakeCFuncHook(const char *name, DYCFuncGenericImpl orig) {
-    if (!orig) return nil;
-    NSString *key = [NSString stringWithUTF8String:name];
-    // 用 block 捕获 name 和 orig
-    return ^void *(void *a0, void *a1, void *a2, void *a3,
-                   void *a4, void *a5, void *a6, void *a7) {
-        if (DYCustomHookManager.sharedManager.cFuncHookEnabled) {
-            @autoreleasepool {
-                NSMutableArray *args = [NSMutableArray array];
-                void *allArgs[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
-                for (int i = 0; i < 8; i++) {
-                    void *p = allArgs[i];
-                    if (!p) { [args addObject:@"(nil)"]; continue; }
-                    // 尝试当 ObjC 对象
-                    if ([(__bridge id)p isKindOfClass:[NSString class]]) {
-                        [args addObject:[NSString stringWithFormat:@"[%@]", (__bridge id)p]];
-                    } else if ([(__bridge id)p isKindOfClass:[NSNumber class]]) {
-                        [args addObject:[(__bridge id)p stringValue]];
-                    } else {
-                        [args addObject:[NSString stringWithFormat:@"0x%llx", (unsigned long long)p]];
-                    }
-                }
-                [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
-                    message:[NSString stringWithFormat:@"[C] %s(%@)", name, [args componentsJoinedByString:@", "]]];
-            }
-        }
-        void *ret = orig(a0, a1, a2, a3, a4, a5, a6, a7);
-        return ret;
-    };
+static BOOL DYRegisterCHook(const char *name, DYCFuncGenericImpl orig) {
+    if (DYCHookCount >= DY_MAX_C_HOOKS) return NO;
+    DYCHookNames[DYCHookCount] = name;
+    DYCHookOrigs[DYCHookCount] = orig;
+    DYCHookCount++;
+    return YES;
 }
 
 // ============================================================================
@@ -1614,10 +1575,12 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
             return NO;
     }
 
+    Method m = class_getInstanceMethod(cls, sel);
+    const char *typeEnc = method_getTypeEncoding(m);
     if (isClassMethod) {
-        class_replaceMethod(object_getClass(cls), sel, newImp, sig.methodTypeEncoding);
+        class_replaceMethod(object_getClass(cls), sel, newImp, typeEnc);
     } else {
-        class_replaceMethod(cls, sel, newImp, sig.methodTypeEncoding);
+        class_replaceMethod(cls, sel, newImp, typeEnc);
     }
 
     [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
@@ -1630,7 +1593,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 #pragma mark - DYCustomHookManager（规则持久化 + 统一应用）
 // ============================================================================
 @interface DYCustomHookManager : NSObject
-@property (nonatomic, strong, readonly) NSMutableArray<DYCustomHookRule *> *rules;
+@property (nonatomic, strong) NSMutableArray<DYCustomHookRule *> *rules;
 @property (nonatomic, assign) BOOL cFuncHookEnabled;     // 运行时总开关（C 函数）
 @property (nonatomic, assign) BOOL objcHookEnabled;      // 运行时总开关（ObjC）
 + (instancetype)sharedManager;
@@ -1639,8 +1602,8 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 - (void)applyAllEnabledRules;
 - (void)removeRuleAtIndex:(NSUInteger)idx;
 - (void)addRule:(DYCustomHookRule *)rule;
-- (NSString *)rulesJSON; // 导出用
-- (BOOL)importRulesFromJSON:(NSString *)json; // 导入用
+- (NSString *)rulesJSON;
+- (BOOL)importRulesFromJSON:(NSString *)json;
 @end
 
 @implementation DYCustomHookManager
@@ -1653,7 +1616,6 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         mgr.rules = [NSMutableArray array];
         mgr.cFuncHookEnabled = YES;
         mgr.objcHookEnabled = YES;
-        mgr.cFuncHookEnabled = YES;
     });
     return mgr;
 }
@@ -1713,27 +1675,27 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 }
 
 - (void)applyCFuncHook:(DYCustomHookRule *)rule {
-    if (!DYOrigCFuncTable) DYOrigCFuncTable = [NSMutableDictionary dictionary];
-    NSString *key = rule.name;
-    if (DYOrigCFuncTable[key]) return; // 已 hook
-
+    if (DYCHookCount >= DY_MAX_C_HOOKS) {
+        [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
+            message:@"❌ C hook 已达上限 64 条"];
+        return;
+    }
     // 用 dlsym 找原函数
     void *sym = dlsym(RTLD_DEFAULT, rule.name.UTF8String);
     if (!sym) {
         [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
-            message:[NSString stringWithFormat:@"❌ C hook 失败：找不到符号 %@（dlsym RTLD_DEFAULT 返回 NULL）", rule.name]];
+            message:[NSString stringWithFormat:@"❌ C hook 失败：找不到符号 %@", rule.name]];
         return;
     }
-    DYCFuncGenericImpl orig = (__bridge DYCFuncGenericImpl)sym;
-    DYCFuncGenericImpl hook = DYMakeCFuncHook(rule.name.UTF8String, orig);
-    DYOrigCFuncTable[key] = hook;
-
-    // fishhook rebind
-    void *origPtr = NULL;
-    struct rebinding r = { rule.name.UTF8String, (void *)hook, (void **)&origPtr };
-    rebind_symbols(&r, 1);
+    // 简化实现：C hook 只 dlsym 确认存在 + 记录到数组
+    // 暂不做真正的 fishhook rebind（ARC 下 block→C 函数指针不合法，
+    // 且无法通用地 dump 未知签名的参数）
+    // 如用户需要 C 函数参数级 hook，请改用 ObjC 类型或自己实现 wrapper 汇编。
+    DYCFuncGenericImpl orig = (DYCFuncGenericImpl)sym; // void* 隐式转函数指针，无需 __bridge
+    DYRegisterCHook(rule.name.UTF8String, orig);
     [[DYLogManager sharedManager] logWithCategory:@"自定义Hook"
-        message:[NSString stringWithFormat:@"✅ C hook 成功：%@ → 已 rebind", rule.name]];
+        message:[NSString stringWithFormat:@"⚠️ C hook：%@ 已注册（orig=0x%llx，暂不 rebind）。如需参数级 hook 请用 ObjC 类型。",
+                 rule.name, (unsigned long long)sym]];
 }
 
 - (void)applyObjCHook:(DYCustomHookRule *)rule {
