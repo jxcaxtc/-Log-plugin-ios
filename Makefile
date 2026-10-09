@@ -30,6 +30,7 @@ Test_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 #   Network              : NWPath / NWParameters
 #   CFNetwork            : CFNetworkCopySystemProxySettings
 Test_FRAMEWORKS = UIKit Foundation Network CFNetwork CommonCrypto
+Test_LIBRARIES = sqlite3
 
 # 链接的动态库（libobjc 用于 runtime swizzle）
 Test_LDFLAGS = -lobjc

@@ -39,6 +39,7 @@
 #import <string.h>                         // strcmp
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <sqlite3.h>
 #import "fishhook.h"                       // fishhook rebind_symbols
 
 // ============================================================================
@@ -1032,6 +1033,130 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
 @end
 
 // ============================================================================
+#pragma mark - 数据库读取 / SQL 监控
+// ============================================================================
+// hook libsqlite3 的 prepare / exec / open / close，捕获：
+//   - SQL 语句（SELECT / INSERT / UPDATE / DELETE ...）
+//   - 数据库文件路径
+//   - CoreData / FMDB 等上层封装底层走的也是 sqlite3，所以一并覆盖
+// 无单独开关（按你要求：直接进日志）。
+// ============================================================================
+
+// ---- 原函数指针 ----
+static int (*DYOriginalSQLite3PrepareV2)(sqlite3 *db, const char *zSql, int nByte,
+                                         sqlite3_stmt **ppStmt, const char **pzTail) = NULL;
+static int (*DYOriginalSQLite3Exec)(sqlite3 *db, const char *zCmd,
+                                    int (*xCallback)(void *, int, char **, char **),
+                                    void *pCallbackArg, char **pzErrMsg) = NULL;
+static sqlite3 *(*DYOriginalSQLite3OpenV2)(const char *zFilename, sqlite3 **ppDb,
+                                          int flags, const char *zVfs) = NULL;
+static int (*DYOriginalSQLite3Close)(sqlite3 *db) = NULL;
+
+// 用 db 句柄反查已打开的数据库路径（sqlite3_db_filename 是 sqlite3 正式 API）
+static NSString *DYDBPath(sqlite3 *db) {
+    if (!db) return @"(null)";
+    const char *path = sqlite3_db_filename(db, "main");
+    if (!path || !*path) path = sqlite3_db_filename(db, ""); // 某些 sqlite3 版本第二个参数传 "" 也能拿到
+    if (!path || !*path) return @"(unknown in-memory or temp db)";
+    return [NSString stringWithUTF8String:path];
+}
+
+// ---- Hooked 实现 ----
+
+static int DYHookedSQLite3PrepareV2(sqlite3 *db, const char *zSql, int nByte,
+                                    sqlite3_stmt **ppStmt, const char **pzTail) {
+    int result = DYOriginalSQLite3PrepareV2(db, zSql, nByte, ppStmt, pzTail);
+    if (zSql && *zSql) {
+        @autoreleasepool {
+            NSString *sql = [NSString stringWithUTF8String:zSql];
+            // 只截取 SQL 第一行（去掉 \n 避免日志爆炸），最多 200 字符
+            NSRange nl = [sql rangeOfString:@"\n"];
+            if (nl.location != NSNotFound) sql = [sql substringToIndex:nl.location];
+            if (sql.length > 200) sql = [[sql substringToIndex:200] stringByAppendingFormat:@"...(%zu chars)", sql.length];
+
+            NSString *op = @"其他";
+            NSString *upper = [sql uppercaseString];
+            if ([upper hasPrefix:@"SELECT"]) op = @"SELECT 查询";
+            else if ([upper hasPrefix:@"INSERT"]) op = @"INSERT 写入";
+            else if ([upper hasPrefix:@"UPDATE"]) op = @"UPDATE 更新";
+            else if ([upper hasPrefix:@"DELETE"]) op = @"DELETE 删除";
+            else if ([upper hasPrefix:@"CREATE"]) op = @"CREATE 建表";
+            else if ([upper hasPrefix:@"DROP"]) op = @"DROP 删除";
+            else if ([upper hasPrefix:@"ALTER"]) op = @"ALTER 变更";
+
+            NSString *msg = [NSString stringWithFormat:@"SQL %@ | db: %@ | result: %d | %@",
+                              op, DYDBPath(db), result, sql];
+            [[DYLogManager sharedManager] logWithCategory:@"数据库" message:msg];
+        }
+    }
+    return result;
+}
+
+static int DYHookedSQLite3Exec(sqlite3 *db, const char *zCmd,
+                               int (*xCallback)(void *, int, char **, char **),
+                               void *pCallbackArg, char **pzErrMsg) {
+    int result = DYOriginalSQLite3Exec(db, zCmd, xCallback, pCallbackArg, pzErrMsg);
+    if (zCmd && *zCmd) {
+        @autoreleasepool {
+            NSString *sql = [NSString stringWithUTF8String:zCmd];
+            if (sql.length > 200) sql = [[sql substringToIndex:200] stringByAppendingString:@"..."];
+            NSString *msg = [NSString stringWithFormat:@"SQL exec | db: %@ | result: %d | %@",
+                              DYDBPath(db), result, sql];
+            [[DYLogManager sharedManager] logWithCategory:@"数据库" message:msg];
+        }
+    }
+    return result;
+}
+
+static sqlite3 *DYHookedSQLite3OpenV2(const char *zFilename, sqlite3 **ppDb,
+                                      int flags, const char *zVfs) {
+    sqlite3 *db = DYOriginalSQLite3OpenV2(zFilename, ppDb, flags, zVfs);
+    @autoreleasepool {
+        NSString *path = zFilename ? [NSString stringWithUTF8String:zFilename] : @"(in-memory)";
+        NSString *flagsStr = [NSString stringWithFormat:@"0x%04x", flags];
+        NSString *msg = [NSString stringWithFormat:@"数据库打开 | path: %@ | flags: %@ | handle: %p",
+                          path, flagsStr, db];
+        [[DYLogManager sharedManager] logWithCategory:@"数据库" message:msg];
+    }
+    return db;
+}
+
+static int DYHookedSQLite3Close(sqlite3 *db) {
+    @autoreleasepool {
+        NSString *msg = [NSString stringWithFormat:@"数据库关闭 | db: %@ | handle: %p",
+                          DYDBPath(db), db];
+        [[DYLogManager sharedManager] logWithCategory:@"数据库" message:msg];
+    }
+    return DYOriginalSQLite3Close(db);
+}
+
+// ---- 监控模块 ----
+@interface DYDatabaseMonitor : NSObject <DYMonitor>
+@end
+
+@implementation DYDatabaseMonitor
+
+- (void)startMonitoring {
+    @autoreleasepool {
+        struct rebinding rebindings[] = {
+            { "sqlite3_prepare_v2", (void *)DYHookedSQLite3PrepareV2, (void **)&DYOriginalSQLite3PrepareV2 },
+            { "sqlite3_exec",       (void *)DYHookedSQLite3Exec,       (void **)&DYOriginalSQLite3Exec },
+            { "sqlite3_open_v2",    (void *)DYHookedSQLite3OpenV2,    (void **)&DYOriginalSQLite3OpenV2 },
+            { "sqlite3_close",      (void *)DYHookedSQLite3Close,     (void **)&DYOriginalSQLite3Close },
+        };
+        rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+        DYLog(@"数据库监控 hook 已安装（sqlite3_prepare_v2 / exec / open_v2 / close）");
+        [[DYLogManager sharedManager] logWithCategory:@"系统"
+            message:@"SQLite 数据库访问监控已启动（自动捕获所有 SQL 与文件路径）"];
+    }
+}
+
+- (void)stopMonitoring {
+}
+
+@end
+
+// ============================================================================
 #pragma mark - 悬浮监控面板
 // ============================================================================
 
@@ -1067,16 +1192,14 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
 @property (nonatomic, strong) UIButton *saveButton;
 @property (nonatomic, strong) UIButton *clearButton;
 @property (nonatomic, strong) UIButton *closeButton;
-@property (nonatomic, strong) UISwitch *bypassSwitch;      // 抓包检测拦截
-@property (nonatomic, strong) UILabel *bypassLabel;
-@property (nonatomic, strong) UISwitch *decryptSwitch;    // 加密/哈希 明文捕获
-@property (nonatomic, strong) UILabel *decryptLabel;
-@property (nonatomic, strong) UISwitch *filterSwitch;      // 只显示密钥相关日志
-@property (nonatomic, strong) UILabel *filterLabel;
+@property (nonatomic, strong) UIView *settingsSection;   // iOS Settings 风格 section 容器
+@property (nonatomic, strong) UISwitch *bypassSwitch;
+@property (nonatomic, strong) UISwitch *decryptSwitch;
+@property (nonatomic, strong) UISwitch *filterSwitch;
 @property (nonatomic, strong) DYPanelWindow *panelWindow;
 @property (nonatomic, assign) BOOL isVisible;
-@property (nonatomic, strong) UILongPressGestureRecognizer *longPressGesture; // 长按拖动
-@property (nonatomic, assign) CGPoint initialTouchPoint; // 长按时手指相对面板左上角的偏移量
+@property (nonatomic, strong) UILongPressGestureRecognizer *longPressGesture;
+@property (nonatomic, assign) CGPoint initialTouchPoint;
 @end
 
 @implementation DYFloatingPanel
@@ -1089,191 +1212,230 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
     return self;
 }
 
+// 辅助：创建一个 iOS Settings 风格的行容器（左边 label + 右边 switch）
+// dividerTop/Bottom 控制是否显示分隔线（section 第一行顶部分割线隐藏，最后一行底部隐藏）
+- (UIView *)makeSwitchRowWithTitle:(NSString *)title
+                            target:(id)target
+                            action:(SEL)action
+                         switchOn:(BOOL)on
+                      switchColor:(UIColor *)onColor
+                       dividerTop:(BOOL)divTop
+                    dividerBottom:(BOOL)divBottom {
+    UIView *row = [[UIView alloc] init];
+    row.backgroundColor = [UIColor whiteColor];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *label = [[UILabel alloc] init];
+    label.text = title;
+    label.font = [UIFont systemFontOfSize:15];
+    label.textColor = [UIColor labelColor];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:label];
+
+    UISwitch *sw = [[UISwitch alloc] init];
+    sw.on = on;
+    sw.onTintColor = onColor;
+    sw.translatesAutoresizingMaskIntoConstraints = NO;
+    [sw addTarget:target action:action forControlEvents:UIControlEventValueChanged];
+    [row addSubview:sw];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [label.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
+        [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [sw.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-16],
+        [sw.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [row.heightAnchor constraintEqualToConstant:44],
+    ]];
+
+    // 顶部分割线
+    if (divTop) {
+        UIView *topSep = [[UIView alloc] init];
+        topSep.backgroundColor = [UIColor colorWithWhite:0.9 alpha:1.0];
+        topSep.translatesAutoresizingMaskIntoConstraints = NO;
+        [row addSubview:topSep];
+        [NSLayoutConstraint activateConstraints:@[
+            [topSep.topAnchor constraintEqualToAnchor:row.topAnchor],
+            [topSep.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
+            [topSep.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+            [topSep.heightAnchor constraintEqualToConstant:0.5],
+        ]];
+    }
+    // 底部分割线
+    if (divBottom) {
+        UIView *botSep = [[UIView alloc] init];
+        botSep.backgroundColor = [UIColor colorWithWhite:0.9 alpha:1.0];
+        botSep.translatesAutoresizingMaskIntoConstraints = NO;
+        [row addSubview:botSep];
+        [NSLayoutConstraint activateConstraints:@[
+            [botSep.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+            [botSep.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
+            [botSep.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+            [botSep.heightAnchor constraintEqualToConstant:0.5],
+        ]];
+    }
+
+    return row;
+}
+
 - (void)setupUI {
-    // 纯白背景 + 圆角 + 细边框 + 阴影，接近系统 sheet / popover 风格
-    self.backgroundColor = [UIColor whiteColor];
-    self.layer.cornerRadius = 16.0;
-    self.layer.borderWidth = 0.5;
-    self.layer.borderColor = [UIColor colorWithWhite:0.88 alpha:1.0].CGColor;
+    // 整体：iOS Settings 风格卡片
+    self.backgroundColor = [UIColor colorWithWhite:0.94 alpha:1.0]; // systemGroupedBackground
+    self.layer.cornerRadius = 14.0;
     self.clipsToBounds = NO;
     self.layer.shadowColor = [UIColor blackColor].CGColor;
-    self.layer.shadowOpacity = 0.18;
-    self.layer.shadowOffset = CGSizeMake(0, 4);
-    self.layer.shadowRadius = 16.0;
-    self.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.bounds cornerRadius:self.layer.cornerRadius].CGPath;
+    self.layer.shadowOpacity = 0.12;
+    self.layer.shadowOffset = CGSizeMake(0, 2);
+    self.layer.shadowRadius = 10.0;
 
-    // 标题栏（用细分割线而不是色块，保持 iOS 原生质感）
+    // 标题栏
     UIView *titleBar = [[UIView alloc] init];
-    titleBar.backgroundColor = [UIColor whiteColor];
+    titleBar.backgroundColor = [UIColor clearColor];
     titleBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:titleBar];
 
-    UIView *titleSeparator = [[UIView alloc] init];
-    titleSeparator.backgroundColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-    titleSeparator.translatesAutoresizingMaskIntoConstraints = NO;
-    [titleBar addSubview:titleSeparator];
-
-    // 青色标题
     UILabel *titleLabel = [[UILabel alloc] init];
-    titleLabel.text = @"行为监控面板";
-    titleLabel.textColor = [UIColor systemTealColor];
-    titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    titleLabel.text = @"行为监控";
+    titleLabel.textColor = [UIColor labelColor];
+    titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [titleBar addSubview:titleLabel];
 
-    // 关闭按钮：原生系统按钮风格（SF Symbol 用文字兜底）
     self.closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.closeButton setTitle:@"关闭" forState:UIControlStateNormal];
-    [self.closeButton setTitleColor:[UIColor systemGrayColor] forState:UIControlStateNormal];
-    self.closeButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    [self.closeButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+    self.closeButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
     self.closeButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.closeButton addTarget:self action:@selector(handleClose) forControlEvents:UIControlEventTouchUpInside];
     [titleBar addSubview:self.closeButton];
 
-    // 日志区：浅灰色字（系统 secondary label color）
+    // iOS Settings 风格 section（圆角白底 + 内部分割线）
+    self.settingsSection = [[UIView alloc] init];
+    self.settingsSection.backgroundColor = [UIColor whiteColor];
+    self.settingsSection.layer.cornerRadius = 10.0;
+    self.settingsSection.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
+                                               kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
+    self.settingsSection.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:self.settingsSection];
+
+    // 3 个开关行（Settings 风格，相邻行之间自动显示内部分割线）
+    UIView *row1 = [self makeSwitchRowWithTitle:@"拦截应用检测抓包"
+                                         target:self
+                                         action:@selector(handleBypassSwitch:)
+                                       switchOn:gBypassEnabled
+                                    switchColor:[UIColor systemGreenColor]
+                                     dividerTop:YES
+                                  dividerBottom:NO];
+    UIView *row2 = [self makeSwitchRowWithTitle:@"捕获加密/哈希 密钥与明文"
+                                         target:self
+                                         action:@selector(handleDecryptSwitch:)
+                                       switchOn:gDecryptMonitorEnabled
+                                    switchColor:[UIColor systemTealColor]
+                                     dividerTop:NO
+                                  dividerBottom:NO];
+    UIView *row3 = [self makeSwitchRowWithTitle:@"只显示密钥/加密日志"
+                                         target:self
+                                         action:@selector(handleFilterSwitch:)
+                                       switchOn:gLogFilterKeyOnly
+                                    switchColor:[UIColor systemOrangeColor]
+                                     dividerTop:NO
+                                  dividerBottom:YES];
+    [self.settingsSection addSubview:row1];
+    [self.settingsSection addSubview:row2];
+    [self.settingsSection addSubview:row3];
+
+    // Auto Layout: section 内部垂直堆叠，section 外层约束
+    [NSLayoutConstraint activateConstraints:@[
+        [row1.topAnchor constraintEqualToAnchor:self.settingsSection.topAnchor],
+        [row1.leadingAnchor constraintEqualToAnchor:self.settingsSection.leadingAnchor],
+        [row1.trailingAnchor constraintEqualToAnchor:self.settingsSection.trailingAnchor],
+
+        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor],
+        [row2.leadingAnchor constraintEqualToAnchor:self.settingsSection.leadingAnchor],
+        [row2.trailingAnchor constraintEqualToAnchor:self.settingsSection.trailingAnchor],
+
+        [row3.topAnchor constraintEqualToAnchor:row2.bottomAnchor],
+        [row3.leadingAnchor constraintEqualToAnchor:self.settingsSection.leadingAnchor],
+        [row3.trailingAnchor constraintEqualToAnchor:self.settingsSection.trailingAnchor],
+        [row3.bottomAnchor constraintEqualToAnchor:self.settingsSection.bottomAnchor],
+    ]];
+
+    // 日志区
     self.logTextView = [[UITextView alloc] init];
     self.logTextView.editable = NO;
     self.logTextView.scrollEnabled = YES;
-    self.logTextView.backgroundColor = [UIColor colorWithWhite:0.97 alpha:1.0];
-    self.logTextView.layer.cornerRadius = 8.0;
+    self.logTextView.backgroundColor = [UIColor whiteColor];
+    self.logTextView.layer.cornerRadius = 10.0;
     self.logTextView.layer.borderWidth = 0.5;
     self.logTextView.layer.borderColor = [UIColor colorWithWhite:0.9 alpha:1.0].CGColor;
     self.logTextView.textColor = [UIColor systemGray2Color];
     self.logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
-    self.logTextView.textContainerInset = UIEdgeInsetsMake(6, 6, 6, 6);
+    self.logTextView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
     self.logTextView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.logTextView];
 
-    // 保存按钮：原生 .tinted（system blue）
+    // 保存 / 清空按钮（底部原生 tinted）
     self.saveButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.saveButton setTitle:@"保存日志" forState:UIControlStateNormal];
     self.saveButton.tintColor = [UIColor systemBlueColor];
-    self.saveButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    self.saveButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     self.saveButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.saveButton addTarget:self action:@selector(handleSave) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.saveButton];
 
-    // 清空按钮：原生 tinted（system red）
     self.clearButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.clearButton setTitle:@"清空" forState:UIControlStateNormal];
     self.clearButton.tintColor = [UIColor systemRedColor];
-    self.clearButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    self.clearButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     self.clearButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.clearButton addTarget:self action:@selector(handleClear) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.clearButton];
 
-    // 抓包检测拦截 —— 原生 UISwitch
-    self.bypassLabel = [[UILabel alloc] init];
-    self.bypassLabel.text = @"拦截应用检测抓包";
-    self.bypassLabel.font = [UIFont systemFontOfSize:13];
-    self.bypassLabel.textColor = [UIColor labelColor];
-    self.bypassLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:self.bypassLabel];
-
-    self.bypassSwitch = [[UISwitch alloc] init];
-    self.bypassSwitch.on = gBypassEnabled;
-    self.bypassSwitch.onTintColor = [UIColor systemGreenColor];
-    self.bypassSwitch.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.bypassSwitch addTarget:self action:@selector(handleBypassSwitch:) forControlEvents:UIControlEventValueChanged];
-    [self addSubview:self.bypassSwitch];
-
-    // 加密/哈希 明文捕获 —— 原生 UISwitch
-    self.decryptLabel = [[UILabel alloc] init];
-    self.decryptLabel.text = @"捕获加密/哈希 密钥与明文";
-    self.decryptLabel.font = [UIFont systemFontOfSize:13];
-    self.decryptLabel.textColor = [UIColor labelColor];
-    self.decryptLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:self.decryptLabel];
-
-    self.decryptSwitch = [[UISwitch alloc] init];
-    self.decryptSwitch.on = gDecryptMonitorEnabled;
-    self.decryptSwitch.onTintColor = [UIColor systemTealColor];
-    self.decryptSwitch.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.decryptSwitch addTarget:self action:@selector(handleDecryptSwitch:) forControlEvents:UIControlEventValueChanged];
-    [self addSubview:self.decryptSwitch];
-
-    // 只显示密钥相关日志 —— 原生 UISwitch
-    self.filterLabel = [[UILabel alloc] init];
-    self.filterLabel.text = @"只显示密钥/加密日志";
-    self.filterLabel.font = [UIFont systemFontOfSize:13];
-    self.filterLabel.textColor = [UIColor labelColor];
-    self.filterLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:self.filterLabel];
-
-    self.filterSwitch = [[UISwitch alloc] init];
-    self.filterSwitch.on = gLogFilterKeyOnly;
-    self.filterSwitch.onTintColor = [UIColor systemOrangeColor];
-    self.filterSwitch.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.filterSwitch addTarget:self action:@selector(handleFilterSwitch:) forControlEvents:UIControlEventValueChanged];
-    [self addSubview:self.filterSwitch];
-
-    // Auto Layout
+    // 外层 Auto Layout
     [NSLayoutConstraint activateConstraints:@[
         // titleBar
-        [titleBar.topAnchor constraintEqualToAnchor:self.topAnchor],
-        [titleBar.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
-        [titleBar.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
-        [titleBar.heightAnchor constraintEqualToConstant:44],
+        [titleBar.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [titleBar.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [titleBar.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [titleBar.heightAnchor constraintEqualToConstant:28],
 
-        [titleSeparator.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor],
-        [titleSeparator.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
-        [titleSeparator.bottomAnchor constraintEqualToAnchor:titleBar.bottomAnchor],
-        [titleSeparator.heightAnchor constraintEqualToConstant:0.5],
-
-        [titleLabel.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor constant:16],
+        [titleLabel.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor],
         [titleLabel.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
 
-        [self.closeButton.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor constant:-8],
+        [self.closeButton.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
         [self.closeButton.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
-        [self.closeButton.heightAnchor constraintEqualToConstant:32],
-        [self.closeButton.widthAnchor constraintGreaterThanOrEqualToConstant:48],
+
+        // settings section
+        [self.settingsSection.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:10],
+        [self.settingsSection.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.settingsSection.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
 
         // logTextView
-        [self.logTextView.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:8],
+        [self.logTextView.topAnchor constraintEqualToAnchor:self.settingsSection.bottomAnchor constant:10],
         [self.logTextView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
         [self.logTextView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
-        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.bypassLabel.topAnchor constant:-8],
 
-        // bypass 开关行（在 decrypt 行上面）
-        [self.bypassLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.bypassLabel.centerYAnchor constraintEqualToAnchor:self.bypassSwitch.centerYAnchor],
-        [self.bypassSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-
-        // decrypt 开关行（在 bypass 行下方）
-        [self.decryptLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.decryptLabel.centerYAnchor constraintEqualToAnchor:self.decryptSwitch.centerYAnchor],
-        [self.decryptSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-        [self.decryptLabel.topAnchor constraintEqualToAnchor:self.bypassLabel.bottomAnchor constant:6],
-
-        // filter 开关行（在 decrypt 行下方，saveButton 上方）
-        [self.filterLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.filterLabel.centerYAnchor constraintEqualToAnchor:self.filterSwitch.centerYAnchor],
-        [self.filterSwitch.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-        [self.filterLabel.topAnchor constraintEqualToAnchor:self.decryptLabel.bottomAnchor constant:6],
-        [self.filterLabel.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
-
-        // saveButton
-        [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
-        [self.saveButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
+        // saveButton / clearButton
+        [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:24],
+        [self.saveButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
         [self.saveButton.heightAnchor constraintEqualToConstant:44],
 
-        // clearButton
-        [self.clearButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
-        [self.clearButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
+        [self.clearButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-24],
+        [self.clearButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
         [self.clearButton.heightAnchor constraintEqualToConstant:44],
+        [self.clearButton.widthAnchor constraintEqualToAnchor:self.saveButton.widthAnchor],
 
-        // 两个按钮在底部中间对齐：save 左，clear 右，自然分布
-        [self.saveButton.trailingAnchor constraintLessThanOrEqualToAnchor:self.clearButton.leadingAnchor constant:-8],
+        // logTextView 底部到底部按钮上方
+        [self.logTextView.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-10],
     ]];
 
-    // 长按拖动手势（长按标题栏后可拖动整个面板，避免误触）
+    // 长按拖动
     self.longPressGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPressDrag:)];
     self.longPressGesture.minimumPressDuration = 0.35;
     self.longPressGesture.allowableMovement = 15.0;
     self.longPressGesture.delegate = self;
     [titleBar addGestureRecognizer:self.longPressGesture];
 
-    // 监听日志更新通知
+    // 监听日志更新
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(onLogUpdate:)
                                                  name:DYLogDidUpdateNotification
@@ -1610,6 +1772,10 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
         // 加密 / 哈希 密钥与明文捕获
         DYDecryptMonitor *decryptMonitor = [[DYDecryptMonitor alloc] init];
         [decryptMonitor startMonitoring];
+
+        // SQLite 数据库访问监控（无单独开关，直接进日志）
+        DYDatabaseMonitor *databaseMonitor = [[DYDatabaseMonitor alloc] init];
+        [databaseMonitor startMonitoring];
 
         // 后续新增监控模块在此处注册即可，例如：
         // DYNetworkMonitor *netMonitor = [[DYNetworkMonitor alloc] init];
