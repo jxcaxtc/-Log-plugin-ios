@@ -17,8 +17,8 @@ include $(THEOS)/makefiles/common.mk
 # 库名称（最终产物 libTest.dylib）
 LIBRARY_NAME = Test
 
-# 源文件
-Test_FILES = Test.m
+# 源文件（fishhook.c 是纯 C，-fobjc-arc 对 .c 文件无影响）
+Test_FILES = Test.m fishhook.c
 
 # 编译参数
 #   -fobjc-arc              : 启用 ARC

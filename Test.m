@@ -34,12 +34,10 @@
 #import <objc/message.h>
 #import <Network/Network.h>               // NWPath / NWParameters
 #import <CFNetwork/CFNetwork.h>            // CFNetworkCopySystemProxySettings
-#import <mach-o/dyld.h>                    // 符号重绑定
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-#import <mach/mach.h>                      // vm_protect
+#import <mach-o/dyld.h>                    // _dyld_register_func_for_add_image 等
 #import <dlfcn.h>
 #import <string.h>                         // strcmp
+#import "fishhook.h"                       // fishhook rebind_symbols
 
 // ============================================================================
 #pragma mark - 通用宏与工具函数
@@ -101,135 +99,6 @@ __attribute__((unused))
 static void DYSwizzleClassMethod(Class cls, SEL originalSel, SEL swizzledSel) {
     Class meta = object_getClass(cls);
     DYSwizzleInstanceMethod(meta, originalSel, swizzledSel);
-}
-
-// ----------------------------------------------------------------------------
-// C 函数符号重绑定工具（轻量级 fishhook 实现，仅用系统 API）
-// 说明：用于 Hook CFNetworkCopySystemProxySettings 这类 C 函数。
-//      原理：遍历所有已加载镜像，找到目标符号的 lazy / non-lazy 指针，
-//      将其替换为我们的实现，从而拦截进程内所有调用方。
-// ----------------------------------------------------------------------------
-
-typedef struct {
-    const char *name;         // 要 hook 的符号名
-    void *replacement;        // 替换函数地址
-    void **original;          // 保存原函数地址的指针（可为 NULL）
-} DYRebinding;
-
-// 查找 section 内的符号指针并替换
-static void DYRebindIndirectSymbolPointers(DYRebinding *rebindings, int count,
-                                           uint32_t *indirectSymbols,
-                                           struct nlist_64 *symtab,
-                                           const char *strtab,
-                                           void **symbolPointers, uint32_t count2) {
-    for (uint32_t i = 0; i < count2; i++) {
-        uint32_t indirect = indirectSymbols[i];
-        if (indirect == INDIRECT_SYMBOL_ABS || indirect == INDIRECT_SYMBOL_LOCAL) continue;
-        uint32_t symIndex = indirect;
-        if (symIndex >= (uint32_t)(-1)) continue;
-        struct nlist_64 *nl = &symtab[symIndex];
-        if (nl->n_un.n_strx == 0) continue;
-        const char *name = strtab + nl->n_un.n_strx;
-        // 去掉符号前的下划线（C 符号通常带 _ 前缀）
-        if (name[0] == '_') name++;
-        for (int j = 0; j < count; j++) {
-            if (strcmp(name, rebindings[j].name) == 0) {
-                void *oldFunc = symbolPointers[i];
-                if (rebindings[j].original) *rebindings[j].original = oldFunc;
-                symbolPointers[i] = rebindings[j].replacement;
-            }
-        }
-    }
-}
-
-// 处理单个镜像的符号重绑定
-static void DYProcessImage(struct mach_header_64 *header, intptr_t slide,
-                           DYRebinding *rebindings, int count,
-                           const char *skipImageName) {
-    struct segment_command_64 *linkeditSeg = NULL;
-    struct symtab_command *symtabCmd = NULL;
-    struct dysymtab_command *dysymtabCmd = NULL;
-
-    uint8_t *ptr = (uint8_t *)header + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        struct load_command *cmd = (struct load_command *)ptr;
-        if (cmd->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
-            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) {
-                linkeditSeg = seg;
-            }
-        } else if (cmd->cmd == LC_SYMTAB) {
-            symtabCmd = (struct symtab_command *)ptr;
-        } else if (cmd->cmd == LC_DYSYMTAB) {
-            dysymtabCmd = (struct dysymtab_command *)ptr;
-        }
-        ptr += cmd->cmdsize;
-    }
-
-    if (!linkeditSeg || !symtabCmd || !dysymtabCmd) return;
-
-    uint8_t *linkeditBase = (uint8_t *)header + slide + linkeditSeg->fileoff - linkeditSeg->vmaddr;
-    struct nlist_64 *symtab = (struct nlist_64 *)(linkeditBase + symtabCmd->symoff);
-    const char *strtab = (const char *)(linkeditBase + symtabCmd->stroff);
-    uint32_t *indirectSymtab = (uint32_t *)(linkeditBase + dysymtabCmd->indirectsymoff);
-
-    // 遍历所有 section，找 lazy / non-lazy / got 符号指针表
-    ptr = (uint8_t *)header + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        struct load_command *cmd = (struct load_command *)ptr;
-        if (cmd->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
-            struct section_64 *sect = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
-            for (uint32_t j = 0; j < seg->nsects; j++) {
-                uint32_t stype = sect[j].flags & SECTION_TYPE;
-                if (stype == S_LAZY_SYMBOL_POINTERS ||
-                    stype == S_NON_LAZY_SYMBOL_POINTERS ||
-                    stype == S_SYMBOL_STUBS) {
-                    void **symbolPointers = (void **)((uint8_t *)header + slide + sect[j].addr);
-                    uint32_t count2 = sect[j].size / sizeof(void *);
-                    uint32_t *indirect = &indirectSymtab[sect[j].reserved1];
-                    if (stype == S_SYMBOL_STUBS) {
-                        if (sect[j].reserved2 == 0) continue;
-                        count2 = sect[j].size / sect[j].reserved2;
-                    }
-
-                    // 修改前先 vm_protect 把该 section 覆盖的页设为可写
-                    // iOS 上 __DATA 段默认只读，直接写会 SIGSEGV
-                    vm_address_t pageAddr = (vm_address_t)symbolPointers & ~(vm_page_size - 1);
-                    vm_size_t pageSize = (vm_address_t)((uint8_t *)symbolPointers + sect[j].size - 1 + vm_page_size - 1) & ~(vm_page_size - 1);
-                    pageSize -= pageAddr;
-                    vm_protect(mach_task_self(), pageAddr, pageSize, FALSE,
-                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-
-                    DYRebindIndirectSymbolPointers(rebindings, count, indirect,
-                                                   symtab, strtab, symbolPointers, count2);
-                }
-            }
-        }
-        ptr += cmd->cmdsize;
-    }
-}
-
-// 对所有已加载镜像执行重绑定
-static void DYRebindSymbols(DYRebinding *rebindings, int count) {
-    // 找到 Test.dylib 自己的名字，遍历时跳过，避免改自身 GOT 造成 re-entry
-    const char *selfName = NULL;
-    Dl_info info;
-    if (dladdr((void *)DYRebindSymbols, &info)) {
-        selfName = info.dli_fname;
-    }
-
-    uint32_t imageCount = _dyld_image_count();
-    for (uint32_t i = 0; i < imageCount; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (selfName && name && strstr(name, "Test.dylib")) continue;
-
-        const struct mach_header *header = _dyld_get_image_header(i);
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        if (header->magic == MH_MAGIC_64) {
-            DYProcessImage((struct mach_header_64 *)header, slide, rebindings, count, selfName);
-        }
-    }
 }
 
 // ============================================================================
@@ -967,13 +836,13 @@ CFDictionaryRef DYHookedCFNetworkCopySystemProxySettings(void) {
             DYLog(@"未找到 NWParameters 类，跳过 prohibitVirtualInterface hook");
         }
 
-        // 3) Hook C 函数 CFNetworkCopySystemProxySettings（符号重绑定）
-        DYRebinding rebindings[] = {
+        // 3) Hook C 函数 CFNetworkCopySystemProxySettings（用 fishhook 重绑定）
+        struct rebinding rebindings[] = {
             { "CFNetworkCopySystemProxySettings",
               (void *)DYHookedCFNetworkCopySystemProxySettings,
               (void **)&DYOriginalCFNetworkCopySystemProxySettings },
         };
-        DYRebindSymbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+        rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
         if (!DYOriginalCFNetworkCopySystemProxySettings) {
             // 兜底：若符号重绑定未命中，尝试 dlsym 直接取原函数地址
             DYOriginalCFNetworkCopySystemProxySettings =
