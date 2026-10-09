@@ -1453,7 +1453,7 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [switchStack.topAnchor constraintEqualToAnchor:self.logTextView.bottomAnchor constant:6],
         [switchStack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
         [switchStack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
-        [switchStack.heightAnchor constraintEqualToConstant:40],
+        [switchStack.heightAnchor constraintEqualToConstant:56],
 
         // saveButton / clearButton
         [self.saveButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:24],
