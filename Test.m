@@ -1464,6 +1464,10 @@ static DYCFuncGenericImpl DYCHookOrigs[DY_MAX_C_HOOKS];
 static int DYCHookCount = 0;
 
 // DYCustomHookManager forward（下面真正 @interface 之后再写）
+@interface DYCustomHookManager : NSObject
++ (instancetype)sharedManager;
+@property (nonatomic, assign) BOOL objcHookEnabled;
+@end
 
 static BOOL DYRegisterCHook(const char *name, DYCFuncGenericImpl orig) {
     if (DYCHookCount >= DY_MAX_C_HOOKS) return NO;
@@ -1575,8 +1579,8 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
             return NO;
     }
 
-    Method m = class_getInstanceMethod(cls, sel);
-    const char *typeEnc = method_getTypeEncoding(m);
+    Method meth = class_getInstanceMethod(cls, sel);
+    const char *typeEnc = method_getTypeEncoding(meth);
     if (isClassMethod) {
         class_replaceMethod(object_getClass(cls), sel, newImp, typeEnc);
     } else {
