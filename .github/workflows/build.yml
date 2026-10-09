@@ -17,12 +17,14 @@ jobs:
 
       - name: Setup Theos
         run: |
+          set -e
           # 克隆 Theos 到固定目录
           export THEOS="$HOME/theos"
           git clone --recursive https://github.com/theos/theos.git "$THEOS"
-          # 下载 iOS SDK（15.5，兼容绝大多数设备）
-          curl -L "https://github.com/theos/sdks/raw/master/iPhoneOS15.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
+          # 下载 iOS SDK（14.5，来自 theos/sdks releases，单文件 tar.xz，稳定可靠）
+          # 部署目标为 iOS 12.0，14.5 SDK 完全满足需求
           mkdir -p "$THEOS/sdks"
+          curl -L --fail "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS14.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
           ls "$THEOS/sdks"
 
