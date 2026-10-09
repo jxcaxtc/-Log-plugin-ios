@@ -480,7 +480,7 @@ static void DYSetMaxLogLines(NSInteger value) {
 // 提取弹窗文本内容（递归遍历 UILabel/UIButton/UITextView）
 static NSString *DYExtractPopupTexts(UIView *view) {
     NSMutableArray *texts = [NSMutableArray array];
-    void (^visit)(UIView *) = ^(UIView *v) {
+    __block void (^visit)(UIView *) = ^(UIView *v) {
         for (UIView *sub in v.subviews) {
             if ([sub isKindOfClass:[UILabel class]]) {
                 NSString *t = ((UILabel *)sub).text;
