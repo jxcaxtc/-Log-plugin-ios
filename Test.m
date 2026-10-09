@@ -1439,11 +1439,11 @@ static int DYHookedSQLite3Close(sqlite3 *db) {
         [self.clearButton.heightAnchor constraintEqualToConstant:44],
         [self.clearButton.widthAnchor constraintEqualToAnchor:self.saveButton.widthAnchor],
 
-        // switchStack 底部在 saveButton 上方
-        [switchStack.bottomAnchor constraintLessThanOrEqualToAnchor:self.saveButton.topAnchor constant:-6],
+        // switchStack 底部 = saveButton 上方（== 锁死）
+        [switchStack.bottomAnchor constraintEqualToAnchor:self.saveButton.topAnchor constant:-6],
 
-        // logTextView 底部在 switchStack 上方（这样 log 区会自由伸缩直到遇到 switchStack）
-        [self.logTextView.bottomAnchor constraintLessThanOrEqualToAnchor:switchStack.topAnchor constant:-6],
+        // logTextView 底部 = switchStack 顶部 - 6（== 锁死，这样 log 区自动撑满 searchBar 和 switchStack 之间）
+        [self.logTextView.bottomAnchor constraintEqualToAnchor:switchStack.topAnchor constant:-6],
     ]];
 
     // 长按拖动
