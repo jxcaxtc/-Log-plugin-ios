@@ -2245,11 +2245,11 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 }
 
 - (void)setupUI {
-    // 整体：iOS Settings 风格卡片
-    self.backgroundColor = [UIColor colorWithWhite:0.94 alpha:1.0]; // systemGroupedBackground
+    // 整体：iOS Settings 风格卡片（用动态色，自动适配深/浅色）
+    self.backgroundColor = [UIColor systemGroupedBackgroundColor];
     self.layer.cornerRadius = 14.0;
     self.clipsToBounds = NO;
-    self.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.layer.shadowColor = [UIColor labelColor].CGColor;
     self.layer.shadowOpacity = 0.12;
     self.layer.shadowOffset = CGSizeMake(0, 2);
     self.layer.shadowRadius = 10.0;
@@ -2282,19 +2282,19 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
     searchBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:searchBar];
 
-    // 日志区（全部系统默认：secondaryLabelColor + Menlo 11pt）
+    // 日志区（系统动态色：systemBackgroundColor 深=黑 浅=白）
     self.logTextView = [[UITextView alloc] init];
     self.logTextView.editable = NO;
     self.logTextView.scrollEnabled = YES;
-    self.logTextView.backgroundColor = [UIColor whiteColor];
+    self.logTextView.backgroundColor = [UIColor systemBackgroundColor];
     self.logTextView.layer.cornerRadius = 10.0;
     self.logTextView.layer.borderWidth = 0.5;
-    self.logTextView.layer.borderColor = [UIColor colorWithWhite:0.9 alpha:1.0].CGColor;
     self.logTextView.textColor = [UIColor secondaryLabelColor];
     self.logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
     self.logTextView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
     self.logTextView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.logTextView];
+    // borderColor 是 CGColor（静态），手动在 traitCollectionDidChange 刷新
 
     // 保存 / 清空按钮（底部原生 tinted）
     self.saveButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -2379,6 +2379,22 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
                                              selector:@selector(applyLogFilter)
                                                  name:@"DYForceApplyFilter"
                                                object:nil];
+
+    // 第一次刷新 layer 颜色（CGColor 是静态的，必须手动设）
+    [self applyLayerColors];
+}
+
+// layer 的 CGColor 不会自动适配深色模式——每次 traitCollection 变化都手动刷
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    [self applyLayerColors];
+}
+
+- (void)applyLayerColors {
+    // logTextView 边框：separatorColor（深/浅都有合适的细分隔线色）
+    self.logTextView.layer.borderColor = [UIColor separatorColor].CGColor;
+    // 面板阴影
+    self.layer.shadowColor = [UIColor labelColor].CGColor;
 }
 
 // 打开全屏设置页
