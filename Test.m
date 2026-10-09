@@ -2083,34 +2083,109 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         [close.topAnchor constraintEqualToAnchor:about.view.safeAreaLayoutGuide.topAnchor constant:8],
     ]];
 
-    // 内容标签（关于应用说明）
+    // 内容区域很长，改为可滚动的 UIScrollView + UILabel
+    UIScrollView *scroll = [[UIScrollView alloc] init];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.alwaysBounceVertical = YES;
+    [about.view addSubview:scroll];
+
     UILabel *content = [[UILabel alloc] init];
     content.numberOfLines = 0;
     content.textColor = [UIColor labelColor];
-    content.font = [UIFont systemFontOfSize:15];
+    content.font = [UIFont systemFontOfSize:14];
     content.translatesAutoresizingMaskIntoConstraints = NO;
-    [about.view addSubview:content];
+    [scroll addSubview:content];
 
     NSString *bundleVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"1.0";
     content.text = [NSString stringWithFormat:
         @"应用助手\n"
-        @"作者：太平长安\n\n"
-        @"qq号：3778352083\n\n"
+        @"作者：太平长安\n"
+        @"QQ：3778352083\n"
         @"版本 v2.0（构建 %@）\n\n"
-        @"一款 iOS 进程内行为监控插件，支持：\n"
+        @"═══════════════════════════\n"
+        @"一、功能简介\n"
+        @"═══════════════════════════\n"
+        @"一款 iOS 越狱环境下的进程内行为监控插件，注入目标 App 后可实时记录：\n"
         @"• 拦截应用检测抓包（VPN / Proxy / VPN 配置）\n"
-        @"• 捕获 AES / MD5 / SHA 等加密密钥与明文\n"
-        @"• SQLite 数据库访问监控\n"
-        @"• Keychain 账号密码读写监控\n"
-        @"• UserDefaults 配置读写监控\n\n"
-        @"注入方式：通过 libhooker / Substrate 等\n"
-        @"目标系统：iOS 17.0+\n\n"
-        @"Powered by fishhook", bundleVer];
+        @"• 捕获 AES / DES / RC4 / Blowfish 等对称加密密钥与明文\n"
+        @"• 捕获 MD5 / SHA1 / SHA256 / SHA512 哈希输入与输出\n"
+        @"• SQLite 数据库访问监控（打开 / prepare / exec / 关闭）\n"
+        @"• Keychain 账号密码读写监控（SecItemAdd / CopyMatching / Update / Delete）\n"
+        @"• UserDefaults 配置读写监控（objectForKey / setObject / removeObjectForKey）\n"
+        @"• 自定义 Hook：对任意 C 函数或 ObjC 方法进行拦截\n\n"
+        @"═══════════════════════════\n"
+        @"二、自定义 Hook 使用说明\n"
+        @"═══════════════════════════\n"
+        @"进入「设置」→「高级」→「自定义 Hook」，点右上角「+」添加规则：\n\n"
+        @"【C 函数】\n"
+        @"直接输入函数名，例如：\n"
+        @"  SecTrustEvaluate   — 查看 TLS 证书校验参数\n"
+        @"  CC_SHA256          — 额外捕获哈希调用\n"
+        @"  open               — 查看文件路径\n\n"
+        @"【ObjC -实例方法】\n"
+        @"方法名 + 类名，例如：\n"
+        @"  方法名: dataTaskWithRequest:completionHandler:\n"
+        @"  类名:   NSURLSession\n"
+        @"效果: -[NSURLSession dataTaskWithRequest:completionHandler:]\n\n"
+        @"【ObjC +类方法】\n"
+        @"方法名 + 类名，例如：\n"
+        @"  方法名: deviceIdentifierForVendor\n"
+        @"  类名:   UIDevice\n"
+        @"效果: +[UIDevice deviceIdentifierForVendor]\n\n"
+        @"【JSON 导入导出】\n"
+        @"右上角「JSON」按钮：\n"
+        @"• 导出：当前所有规则 → 剪贴板（JSON 数组格式）\n"
+        @"• 导入：从剪贴板读取 JSON 覆盖当前规则\n"
+        @"示例 JSON：\n"
+        @"[{\"type\":\"c\",\"name\":\"SecTrustEvaluate\",\"enabled\":true}]\n\n"
+        @"═══════════════════════════\n"
+        @"三、自定义 Hook 的限制\n"
+        @"═══════════════════════════\n"
+        @"⚠ C 函数参数只 dump 前 8 个（arm64 寄存器 x0-x7），\n"
+        @"  超过 8 个参数的函数后面几个看不到。\n\n"
+        @"⚠ ObjC 方法目前只支持 0-2 个参数的自动 swizzle，\n"
+        @"  参数过多（如 dataTaskWithRequest:completionHandler:）\n"
+        @"  会打警告日志，不会实际 hook。\n\n"
+        @"⚠ ObjC hook 一旦生效无法动态还原 IMP，\n"
+        @"  关掉开关只是停止打日志，原 hook 仍在。\n\n"
+        @"⚠ dlsym 只能找到已加载 image 内的符号，\n"
+        @"  目标函数若在动态加载的 dylib 中可能找不到。\n\n"
+        @"═══════════════════════════\n"
+        @"四、适用范围\n"
+        @"═══════════════════════════\n"
+        @"• 适用：绝大多数 iOS App（银行、社交、电商、游戏等）\n"
+        @"• 适用：使用 Swift / ObjC / C 混合开发的应用\n"
+        @"• 适用：支持 libhooker / Substrate / Substitute 的越狱环境\n"
+        @"• 不适用：App 有完整性校验（TPM / FairPlay / 自研反注入）\n"
+        @"• 不适用：非越狱 iOS（没有进程内注入能力）\n\n"
+        @"═══════════════════════════\n"
+        @"五、运行要求\n"
+        @"═══════════════════════════\n"
+        @"• 注入方式：libhooker / Substrate / Substitute / ElleKit\n"
+        @"• 目标系统：iOS 17.0 及以上\n"
+        @"• 架构：arm64 / arm64e\n"
+        @"• 依赖：fishhook（libdispatch 自带）、Security、sqlite3\n\n"
+        @"═══════════════════════════\n"
+        @"六、免责声明\n"
+        @"═══════════════════════════\n"
+        @"本插件仅供本地安全研究与学习使用。\n"
+        @"禁止用于任何侵犯他人权益或违反法律法规的场景。\n"
+        @"使用者需自行承担全部责任。\n\n"
+        @"Powered by fishhook & Objective-C Runtime\n"
+        @"Built with Theos", bundleVer];
 
     [NSLayoutConstraint activateConstraints:@[
-        [content.topAnchor constraintEqualToAnchor:about.view.safeAreaLayoutGuide.topAnchor constant:40],
-        [content.leadingAnchor constraintEqualToAnchor:about.view.leadingAnchor constant:20],
-        [content.trailingAnchor constraintEqualToAnchor:about.view.trailingAnchor constant:-20],
+        [scroll.topAnchor constraintEqualToAnchor:about.view.safeAreaLayoutGuide.topAnchor constant:36],
+        [scroll.leadingAnchor constraintEqualToAnchor:about.view.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:about.view.trailingAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:about.view.bottomAnchor],
+
+        [content.topAnchor constraintEqualToAnchor:scroll.topAnchor constant:8],
+        [content.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor constant:20],
+        [content.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor constant:-20],
+        [content.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor constant:-20],
+        // 固定宽度，让 UILabel 计算好高度后 scrollView.contentSize 自动撑开
+        [content.widthAnchor constraintEqualToAnchor:scroll.widthAnchor constant:-40],
     ]];
 
     // 半屏 sheet
