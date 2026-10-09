@@ -477,10 +477,13 @@ static void DYSetMaxLogLines(NSInteger value) {
 
 @implementation UIView (DYAlertMonitor)
 
-// 提取弹窗文本内容（递归遍历 UILabel/UIButton/UITextView）
+// 提取弹窗文本内容（迭代遍历 UILabel/UIButton/UITextView）
 static NSString *DYExtractPopupTexts(UIView *view) {
     NSMutableArray *texts = [NSMutableArray array];
-    __block void (^visit)(UIView *) = ^(UIView *v) {
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:view];
+    while (queue.count > 0) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
         for (UIView *sub in v.subviews) {
             if ([sub isKindOfClass:[UILabel class]]) {
                 NSString *t = ((UILabel *)sub).text;
@@ -492,10 +495,9 @@ static NSString *DYExtractPopupTexts(UIView *view) {
                 NSString *t = ((UITextView *)sub).text;
                 if (t.length > 0) [texts addObject:t];
             }
-            visit(sub);
+            [queue addObject:sub];
         }
-    };
-    visit(view);
+    }
     return texts.count > 0 ? [texts componentsJoinedByString:@" | "] : @"(无)";
 }
 
