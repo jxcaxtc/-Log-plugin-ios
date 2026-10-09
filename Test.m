@@ -49,20 +49,35 @@
 // 统一的 NSLog 前缀，方便在设备控制台过滤
 #define DYLog(fmt, ...) NSLog((@"[DYMonitor] " fmt), ##__VA_ARGS__)
 
-// 把二进制数据转成 hex 字符串（用于密钥/明文日志展示）
+// 把二进制数据转成 hex 字符串
 static NSString *DYHexFromBytes(const void *data, size_t len) {
     if (!data || len == 0) return @"(empty)";
     const uint8_t *p = (const uint8_t *)data;
     size_t cap = len * 2 + 1;
     char *buf = (char *)malloc(cap);
     if (!buf) return @"(oom)";
-    for (size_t i = 0; i < len; i++) {
-        sprintf(buf + i * 2, "%02x", p[i]);
-    }
+    for (size_t i = 0; i < len; i++) sprintf(buf + i * 2, "%02x", p[i]);
     NSString *s = [NSString stringWithUTF8String:buf];
     free(buf);
     if (len > 64) s = [s stringByAppendingFormat:@"...(%zu bytes total)", len];
     return s;
+}
+
+// 把二进制里"可打印 ASCII 部分"抽出来显示，方便看明文
+// 比如 HTTP 请求体就是 ASCII 明文，hex 只是进制表示
+static NSString *DYAsciiFromBytes(const void *data, size_t len) {
+    if (!data || len == 0) return @"";
+    const uint8_t *p = (const uint8_t *)data;
+    size_t printable = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] >= 0x20 && p[i] <= 0x7E) printable++;
+    }
+    if (printable == 0) return @""; // 全非 ASCII，不输出明文字段
+    if ((double)printable / (double)len < 0.7) return @""; // ASCII 比例不够高，判定为二进制数据
+    NSString *utf8 = [[NSString alloc] initWithBytes:p length:len encoding:NSUTF8StringEncoding];
+    if (!utf8) return @"";
+    if (utf8.length > 200) utf8 = [[utf8 substringToIndex:200] stringByAppendingFormat:@"...(%zu chars)", utf8.length];
+    return utf8;
 }
 
 // 全局开关：加密监控是否启用
@@ -936,7 +951,10 @@ static int DYHookedCCCrypt(CCOperation op, CCAlgorithm alg, CCOptions options,
                 @"%@ %@ | key(%zu bytes): %@",
                 algName, opName, keyLength, DYHexFromBytes(key, keyLength)];
             if (iv) [msg appendFormat:@" | iv: %@", DYHexFromBytes(iv, 16)];
+            // 输入：hex + 可能的明文（ASCII 友好）
             [msg appendFormat:@" | 输入(%zu bytes): %@", dataInLength, DYHexFromBytes(dataIn, dataInLength)];
+            NSString *asciiIn = DYAsciiFromBytes(dataIn, dataInLength);
+            if (asciiIn.length > 0) [msg appendFormat:@" | 明文: %@", asciiIn];
 
             // 先调原函数拿到结果，再输出密文/明文
             int result = DYOriginalCCCrypt(op, alg, options, key, keyLength, iv,
@@ -961,10 +979,12 @@ static int DYHookedCC_MD5(const void *data, CC_LONG len, unsigned char *md) {
     int result = DYOriginalCC_MD5(data, len, md);
     if (gDecryptMonitorEnabled && result) {
         @autoreleasepool {
-            [[DYLogManager sharedManager] logWithCategory:@"加密"
-                message:[NSString stringWithFormat:
-                    @"MD5 | 输入(%u bytes): %@ | 输出: %@",
-                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_MD5_DIGEST_LENGTH)]];
+            NSString *ascii = DYAsciiFromBytes(data, len);
+            NSMutableString *msg = [NSMutableString stringWithFormat:
+                @"MD5 | 输入(%u bytes): %@", len, DYHexFromBytes(data, len)];
+            if (ascii.length > 0) [msg appendFormat:@" | 明文: %@", ascii];
+            [msg appendFormat:@" | 输出: %@", DYHexFromBytes(md, CC_MD5_DIGEST_LENGTH)];
+            [[DYLogManager sharedManager] logWithCategory:@"加密" message:msg];
         }
     }
     return result;
@@ -974,10 +994,12 @@ static int DYHookedCC_SHA1(const void *data, CC_LONG len, unsigned char *md) {
     int result = DYOriginalCC_SHA1(data, len, md);
     if (gDecryptMonitorEnabled && result) {
         @autoreleasepool {
-            [[DYLogManager sharedManager] logWithCategory:@"加密"
-                message:[NSString stringWithFormat:
-                    @"SHA1 | 输入(%u bytes): %@ | 输出: %@",
-                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_SHA1_DIGEST_LENGTH)]];
+            NSString *ascii = DYAsciiFromBytes(data, len);
+            NSMutableString *msg = [NSMutableString stringWithFormat:
+                @"SHA1 | 输入(%u bytes): %@", len, DYHexFromBytes(data, len)];
+            if (ascii.length > 0) [msg appendFormat:@" | 明文: %@", ascii];
+            [msg appendFormat:@" | 输出: %@", DYHexFromBytes(md, CC_SHA1_DIGEST_LENGTH)];
+            [[DYLogManager sharedManager] logWithCategory:@"加密" message:msg];
         }
     }
     return result;
@@ -987,10 +1009,12 @@ static int DYHookedCC_SHA256(const void *data, CC_LONG len, unsigned char *md) {
     int result = DYOriginalCC_SHA256(data, len, md);
     if (gDecryptMonitorEnabled && result) {
         @autoreleasepool {
-            [[DYLogManager sharedManager] logWithCategory:@"加密"
-                message:[NSString stringWithFormat:
-                    @"SHA256 | 输入(%u bytes): %@ | 输出: %@",
-                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_SHA256_DIGEST_LENGTH)]];
+            NSString *ascii = DYAsciiFromBytes(data, len);
+            NSMutableString *msg = [NSMutableString stringWithFormat:
+                @"SHA256 | 输入(%u bytes): %@", len, DYHexFromBytes(data, len)];
+            if (ascii.length > 0) [msg appendFormat:@" | 明文: %@", ascii];
+            [msg appendFormat:@" | 输出: %@", DYHexFromBytes(md, CC_SHA256_DIGEST_LENGTH)];
+            [[DYLogManager sharedManager] logWithCategory:@"加密" message:msg];
         }
     }
     return result;
@@ -1000,10 +1024,12 @@ static int DYHookedCC_SHA512(const void *data, CC_LONG len, unsigned char *md) {
     int result = DYOriginalCC_SHA512(data, len, md);
     if (gDecryptMonitorEnabled && result) {
         @autoreleasepool {
-            [[DYLogManager sharedManager] logWithCategory:@"加密"
-                message:[NSString stringWithFormat:
-                    @"SHA512 | 输入(%u bytes): %@ | 输出: %@",
-                    len, DYHexFromBytes(data, len), DYHexFromBytes(md, CC_SHA512_DIGEST_LENGTH)]];
+            NSString *ascii = DYAsciiFromBytes(data, len);
+            NSMutableString *msg = [NSMutableString stringWithFormat:
+                @"SHA512 | 输入(%u bytes): %@", len, DYHexFromBytes(data, len)];
+            if (ascii.length > 0) [msg appendFormat:@" | 明文: %@", ascii];
+            [msg appendFormat:@" | 输出: %@", DYHexFromBytes(md, CC_SHA512_DIGEST_LENGTH)];
+            [[DYLogManager sharedManager] logWithCategory:@"加密" message:msg];
         }
     }
     return result;
