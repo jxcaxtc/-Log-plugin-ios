@@ -184,6 +184,11 @@ static BOOL gBypassEnabled = YES;
 
 static BOOL gAntiCrashEnabled = YES;
 
+// 前向声明（这些函数引用 DYLogManager / UIKit，定义在本文件更后面）
+static void DYShowCrashAlert(void);
+static void DYInstallAntiCrash(void);
+@class DYLogManager;
+
 // 原始 C 函数指针（fishhook 会填）
 static void (*gOrigExit)(int) = NULL;
 static void (*gOrigAbort)(void) = NULL;
@@ -317,8 +322,9 @@ static void DYObjCExceptionHandler(NSException *exception) {
         return;
     }
     gCrashType = 2;
-    snprintf(gCrashReason, sizeof(gCrashReason),
-             "ObjC Exception: %@ - %s", exception.name, exception.reason.UTF8String ?: "(no reason)");
+    NSString *reasonStr = [NSString stringWithFormat:@"ObjC Exception: %@ - %@",
+                           exception.name, exception.reason ?: @"(no reason)"];
+    strncpy(gCrashReason, reasonStr.UTF8String ?: "(unknown)", sizeof(gCrashReason) - 1);
 
     // 构建完整 crash log（含 ObjC 栈）
     NSMutableString *log = [NSMutableString string];
@@ -449,13 +455,21 @@ static void DYPatchedAbort(void) {
 static void DYShowCrashAlert(void) {
     // 找最顶层 VC 来 present
     UIViewController *topVC = nil;
-    UIWindow *keyWin = nil;
-    for (UIScreen *s in [UIScreen screens]) {
-        for (UIWindow *w in s.windows) {
-            if (w.isKeyWindow) { keyWin = w; break; }
+    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+    if (!keyWin) {
+        // iOS 13+ 用 connectedScenes
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]]) {
+                    UIWindowScene *ws = (UIWindowScene *)scene;
+                    for (UIWindow *w in ws.windows) {
+                        if (w.isKeyWindow) { keyWin = w; break; }
+                    }
+                    if (keyWin) break;
+                }
+            }
         }
     }
-    if (!keyWin) keyWin = [UIApplication sharedApplication].keyWindow;
     if (!keyWin) return;
 
     topVC = keyWin.rootViewController;
@@ -486,11 +500,20 @@ static void DYShowCrashAlert(void) {
     [alert addAction:[UIAlertAction actionWithTitle:@"查看日志目录"
                                                style:UIAlertActionStyleDefault
                                              handler:^(UIAlertAction *a) {
-        // 在日志面板里展示
-        [[DYLogManager sharedManager] logWithCategory:@"崩溃"
-            message:[NSString stringWithFormat:@"📁 崩溃日志路径: %@", logPath ?: displayPath]];
-        [[DYLogManager sharedManager] logWithCategory:@"崩溃"
-            message:[NSString stringWithFormat:@"💥 崩溃类型: %@", typeDesc]];
+        // 在日志面板里展示（用 performSelector 绕开前向声明限制）
+        id mgr = [NSClassFromString(@"DYLogManager") performSelector:@selector(sharedManager)];
+        if (mgr) {
+            NSString *msg1 = [NSString stringWithFormat:@"📁 崩溃日志路径: %@", logPath ?: displayPath];
+            NSString *msg2 = [NSString stringWithFormat:@"💥 崩溃类型: %@", typeDesc];
+            [mgr performSelector:@selector(logWithCategory:message:)
+                        withObject:@"崩溃"
+                        withObject:msg1];
+            [mgr performSelector:@selector(logWithCategory:message:)
+                        withObject:@"崩溃"
+                        withObject:msg2];
+        }
+        NSLog(@"[应用助手] 📁 崩溃日志路径: %@", logPath ?: displayPath);
+        NSLog(@"[应用助手] 💥 崩溃类型: %@", typeDesc);
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"忽略（继续运行）"
@@ -565,8 +588,12 @@ static void DYInstallAntiCrash(void) {
         }
     });
 
-    [[DYLogManager sharedManager] logWithCategory:@"系统"
-        message:@"✅ 强力防崩溃已启动（signal+exception+C+++exit/abort 全拦截）"];
+    id mgr = [NSClassFromString(@"DYLogManager") performSelector:@selector(sharedManager)];
+    if (mgr) {
+        [mgr performSelector:@selector(logWithCategory:message:)
+                    withObject:@"系统"
+                    withObject:@"✅ 强力防崩溃已启动（signal+exception+C+++exit/abort 全拦截）"];
+    }
 }
 
 // 全局总开关：关闭后所有日志不捕获、不显示，但 hook 仍在运行
