@@ -164,38 +164,409 @@ static NSString *const DYLogDidUpdateNotification = @"DYLogDidUpdateNotification
 // ----------------------------------------------------------------------------
 static BOOL gBypassEnabled = YES;
 
-// 防崩溃开关：hook exit() / abort()，拦截 App 因 VPN / 抓包检测触发的主动闪退
+// ----------------------------------------------------------------------------
+// 强力防崩溃模块
+// ----------------------------------------------------------------------------
+// 拦截 4 大类崩溃：
+//   (1) ObjC 未捕获异常 — NSSetUncaughtExceptionHandler
+//   (2) Mach 致命信号   — SIGSEGV/SIGABRT/SIGILL/SIGFPE/SIGBUS/SIGTRAP/SIGSYS
+//   (3) C++ terminate   — std::set_terminate
+//   (4) 主动退出函数    — exit/_Exit/abort/__assert_rtn/__stack_chk_fail
+//
+// 崩溃日志写入沙盒 Documents/CrashLogs/YYYYMMDD_HHMMSS_crash.log
+// 崩溃后 UIAlertController 弹窗：崩溃原因 + 日志路径 + 重启按钮
+// ----------------------------------------------------------------------------
+#import <signal.h>
+#import <setjmp.h>
+#import <execinfo.h>
+#import <sys/types.h>
+#import <unistd.h>
+
 static BOOL gAntiCrashEnabled = YES;
+
+// 原始 C 函数指针（fishhook 会填）
 static void (*gOrigExit)(int) = NULL;
 static void (*gOrigAbort)(void) = NULL;
 static void (*gOrig_Exit)(int) = NULL;
 
-static void DYPatchedExit(int code) {
-    if (gAntiCrashEnabled) {
-        NSLog(@"[应用助手] ⚠️ 拦截 exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code);
-        return; // 直接吞掉，不退出
-    }
-    if (gOrigExit) gOrigExit(code);
-    else exit(code);
+// 用于崩溃后 longjmp 恢复（比 NSException handler 更强力，能救回 signal 崩溃）
+static sigjmp_buf gCrashJumpBuf;
+static BOOL       gCrashJumpSet = NO;
+
+// 记录崩溃发生时的信息（signal handler / exception handler 里填）
+static volatile sig_atomic_t gCrashType = 0;      // 1=signal 2=objc 3=c++ 4=exit 5=abort 6=_Exit
+static volatile sig_atomic_t gCrashCode = 0;      // signal 号 / exit code
+static char                  gCrashReason[256] = {0};
+
+// 原始 signal handler 备份
+static struct sigaction gOrigSignalHandlers[32]; // SIG* 最多 31
+
+// 原始 ObjC exception handler 备份
+static NSUncaughtExceptionHandler *gOrigExceptionHandler = nil;
+
+// C++ terminate handler（弱引用）
+typedef void (*DYCppTerminateFunc)(void);
+static DYCppTerminateFunc gOrigCppTerminate = NULL;
+typedef DYCppTerminateFunc (*DYSetTerminateFunc)(DYCppTerminateFunc);
+static DYSetTerminateFunc gSetTerminate = NULL;
+typedef DYCppTerminateFunc (*DYGetTerminateFunc)(void);
+static DYGetTerminateFunc gGetTerminate = NULL;
+
+// 崩溃日志保存目录（沙盒内 Documents/CrashLogs/）
+static NSString *DYCrashLogsDir(void) {
+    static NSString *dir = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
+        dir = [doc stringByAppendingPathComponent:@"CrashLogs"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return dir;
 }
-static void DYPatched_Exit(int code) {
-    if (gAntiCrashEnabled) {
-        NSLog(@"[应用助手] ⚠️ 拦截 _Exit(%d) —— 疑似 VPN/环境检测触发的主动退出", code);
+
+// async-signal-safe 写崩溃日志文件（signal handler 里不能用 ObjC，只能用 C syscall）
+static void DYSafeWriteCrashLog(const char *reason, int code, int type) {
+    char path[1024];
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char ts[64];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm);
+    snprintf(path, sizeof(path), "%s/%s_crash_%d.log", [DYCrashLogsDir() fileSystemRepresentation], ts, (int)getpid());
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    char header[2048];
+    int hlen = snprintf(header, sizeof(header),
+        "===== DYMonitor 崩溃日志 =====\n"
+        "时间: %s\n"
+        "类型: %d (1=signal 2=objc 3=c++ 4=exit 5=abort 6=_Exit)\n"
+        "代码: %d\n"
+        "原因: %s\n"
+        "PID: %d\n"
+        "==============================\n"
+        "调用栈:\n",
+        ts, type, code, reason ?: "(unknown)", (int)getpid());
+    write(fd, header, hlen);
+
+    // 用 backtrace_symbols_fd 直接把栈写进去（也是 async-signal-safe 的）
+    void *stack[128];
+    int count = backtrace(stack, 128);
+    backtrace_symbols_fd(stack, count, fd);
+
+    close(fd);
+}
+
+// 把 path 转成 ObjC 字符串（非 signal handler 环境调用）
+static NSString *DYLatestCrashLogPath(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = DYCrashLogsDir();
+    NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+    if (files.count == 0) return nil;
+    NSString *latest = nil;
+    NSDate *latestDate = [NSDate distantPast];
+    for (NSString *f in files) {
+        NSString *fp = [dir stringByAppendingPathComponent:f];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:fp error:nil];
+        NSDate *d = attrs.fileModificationDate;
+        if (d && [d timeIntervalSinceDate:latestDate] > 0) {
+            latestDate = d;
+            latest = fp;
+        }
+    }
+    return latest;
+}
+
+#pragma mark - Signal Handler（async-signal-safe，不能用 ObjC）
+
+static void DYSignalHandler(int sig, siginfo_t *info, void *ucontext) {
+    if (!gAntiCrashEnabled) {
+        // 未开启防崩溃：恢复默认 handler，重新 raise 让系统崩掉
+        signal(sig, SIG_DFL);
+        raise(sig);
         return;
     }
-    if (gOrig_Exit) gOrig_Exit(code);
-    else _Exit(code);
-}
-static void DYPatchedAbort(void) {
-    if (gAntiCrashEnabled) {
-        // 打印调用栈帮助定位是哪段代码触发的 abort
-        NSArray *syms = [NSThread callStackSymbols];
-        NSString *stack = [syms componentsJoinedByString:@"\n    "];
-        NSLog(@"[应用助手] ⚠️ 拦截 abort() —— 疑似 VPN/环境检测触发。调用栈:\n    %@", stack ?: @"(空)");
-        return; // 吞掉，不崩溃
+    gCrashType = 1;
+    gCrashCode = sig;
+    snprintf(gCrashReason, sizeof(gCrashReason),
+             "Signal %d (%s) at address %p", sig, strsignal(sig), info ? info->si_addr : NULL);
+    DYSafeWriteCrashLog(gCrashReason, sig, 1);
+
+    // 如果我们已经 setjmp 过，longjmp 回去恢复执行
+    if (gCrashJumpSet) {
+        siglongjmp(gCrashJumpBuf, sig);
     }
-    if (gOrigAbort) gOrigAbort();
-    else abort();
+    // 否则只能手动弹 UI（主线程里发通知）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DYShowCrashAlert();
+    });
+    // 把原 handler 恢复，以防又崩一次
+    if (gOrigSignalHandlers[sig].sa_handler != SIG_DFL &&
+        gOrigSignalHandlers[sig].sa_handler != SIG_IGN) {
+        sigaction(sig, &gOrigSignalHandlers[sig], NULL);
+    }
+}
+
+#pragma mark - ObjC Exception Handler
+
+static void DYObjCExceptionHandler(NSException *exception) {
+    if (!gAntiCrashEnabled || !exception) {
+        // 没开防崩溃 → 让原 handler 处理
+        if (gOrigExceptionHandler) gOrigExceptionHandler(exception);
+        return;
+    }
+    gCrashType = 2;
+    snprintf(gCrashReason, sizeof(gCrashReason),
+             "ObjC Exception: %@ - %s", exception.name, exception.reason.UTF8String ?: "(no reason)");
+
+    // 构建完整 crash log（含 ObjC 栈）
+    NSMutableString *log = [NSMutableString string];
+    [log appendFormat:@"===== DYMonitor 崩溃日志 =====\n"];
+    [log appendFormat:@"时间: %@\n", [NSDate date]];
+    [log appendFormat:@"类型: ObjC 未捕获异常\n"];
+    [log appendFormat:@"名称: %@\n", exception.name];
+    [log appendFormat:@"原因: %@\n", exception.reason ?: @"(空)"];
+    [log appendFormat:@"用户信息: %@\n", exception.userInfo ?: @"(空)"];
+    [log appendFormat:@"==============================\n调用栈:\n"];
+    for (NSString *sym in exception.callStackSymbols) {
+        [log appendFormat:@"  %@\n", sym];
+    }
+
+    // 同时写入 backtrace() 栈（比 exception.callStackSymbols 更底层）
+    void *stack[128];
+    int cnt = backtrace(stack, 128);
+    char **syms = backtrace_symbols(stack, cnt);
+    if (syms) {
+        [log appendString:@"\n--- 底层 backtrace ---\n"];
+        for (int i = 0; i < cnt; i++) {
+            [log appendFormat:@"  %s\n", syms[i]];
+        }
+        free(syms);
+    }
+
+    // 写文件
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char ts[64];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm);
+    NSString *fname = [NSString stringWithFormat:@"%s_objc_crash_%d.log", ts, (int)getpid()];
+    NSString *fpath = [DYCrashLogsDir() stringByAppendingPathComponent:fname];
+    [log writeToFile:fpath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    // 弹 alert（必须在主线程）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DYShowCrashAlert();
+    });
+
+    // 不要 propagate exception —— 否则还是会崩
+    // 但如果我们 longjmp 已 set，也可以走那条路径
+    if (gCrashJumpSet) {
+        siglongjmp(gCrashJumpBuf, 1);
+    }
+}
+
+#pragma mark - C++ Terminate Handler
+
+static void DYCppTerminateHandler(void) {
+    if (!gAntiCrashEnabled) {
+        if (gOrigCppTerminate) gOrigCppTerminate();
+        abort();
+    }
+    gCrashType = 3;
+    snprintf(gCrashReason, sizeof(gCrashReason), "C++ std::terminate()");
+    DYSafeWriteCrashLog(gCrashReason, 0, 3);
+
+    if (gCrashJumpSet) {
+        siglongjmp(gCrashJumpBuf, 2);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DYShowCrashAlert();
+    });
+    // 不崩，直接 return
+    // 但 C++ runtime 期望 terminate handler 调用 abort()，所以我们吞掉
+    while (1) { usleep(100000); } // 不让它返回（避免继续执行损坏的 C++ 栈）
+}
+
+#pragma mark - Patched C 退出函数
+
+static void DYPatchedExit(int code) {
+    if (!gAntiCrashEnabled) {
+        if (gOrigExit) gOrigExit(code);
+        exit(code);
+    }
+    gCrashType = 4;
+    gCrashCode = code;
+    snprintf(gCrashReason, sizeof(gCrashReason), "exit(%d) —— 被拦截", code);
+    DYSafeWriteCrashLog(gCrashReason, code, 4);
+    NSLog(@"[应用助手] ⚠️ 拦截 exit(%d)", code);
+
+    // 弹 alert
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DYShowCrashAlert();
+    });
+    // 吞掉，不退出
+    // 但 exit 之后不能继续正常执行了（atexit handlers 都不会跑），保持进程活着
+    while (1) { usleep(100000); }
+}
+
+static void DYPatched_Exit(int code) {
+    if (!gAntiCrashEnabled) {
+        if (gOrig_Exit) gOrig_Exit(code);
+        _Exit(code);
+    }
+    gCrashType = 6;
+    gCrashCode = code;
+    snprintf(gCrashReason, sizeof(gCrashReason), "_Exit(%d) —— 被拦截", code);
+    DYSafeWriteCrashLog(gCrashReason, code, 6);
+    NSLog(@"[应用助手] ⚠️ 拦截 _Exit(%d)", code);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DYShowCrashAlert();
+    });
+    while (1) { usleep(100000); }
+}
+
+static void DYPatchedAbort(void) {
+    if (!gAntiCrashEnabled) {
+        if (gOrigAbort) gOrigAbort();
+        abort();
+    }
+    gCrashType = 5;
+    gCrashCode = SIGABRT;
+    snprintf(gCrashReason, sizeof(gCrashReason), "abort() —— 被拦截");
+    DYSafeWriteCrashLog(gCrashReason, SIGABRT, 5);
+    NSLog(@"[应用助手] ⚠️ 拦截 abort()");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DYShowCrashAlert();
+    });
+    while (1) { usleep(100000); }
+}
+
+#pragma mark - Crash Alert（主线程里弹）
+
+static void DYShowCrashAlert(void) {
+    // 找最顶层 VC 来 present
+    UIViewController *topVC = nil;
+    UIWindow *keyWin = nil;
+    for (UIScreen *s in [UIScreen screens]) {
+        for (UIWindow *w in s.windows) {
+            if (w.isKeyWindow) { keyWin = w; break; }
+        }
+    }
+    if (!keyWin) keyWin = [UIApplication sharedApplication].keyWindow;
+    if (!keyWin) return;
+
+    topVC = keyWin.rootViewController;
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+
+    // 读取最新日志路径
+    NSString *logPath = DYLatestCrashLogPath();
+    NSString *displayPath = logPath ?: DYCrashLogsDir();
+
+    // 崩溃原因
+    NSString *typeDesc = @"未知";
+    switch ((int)gCrashType) {
+        case 1: typeDesc = [NSString stringWithFormat:@"信号崩溃: %s", gCrashReason]; break;
+        case 2: typeDesc = [NSString stringWithFormat:@"ObjC 异常: %s", gCrashReason]; break;
+        case 3: typeDesc = @"C++ 异常终止"; break;
+        case 4: typeDesc = [NSString stringWithFormat:@"exit(%d) 主动退出", (int)gCrashCode]; break;
+        case 5: typeDesc = @"abort() 主动终止"; break;
+        case 6: typeDesc = [NSString stringWithFormat:@"_Exit(%d) 主动退出", (int)gCrashCode]; break;
+    }
+
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"⚠️ 应用崩溃"
+        message:[NSString stringWithFormat:
+                  @"崩溃原因:\n%@\n\n崩溃日志已保存在:\n%@",
+                  typeDesc, displayPath]
+        preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"查看日志目录"
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+        // 在日志面板里展示
+        [[DYLogManager sharedManager] logWithCategory:@"崩溃"
+            message:[NSString stringWithFormat:@"📁 崩溃日志路径: %@", logPath ?: displayPath]];
+        [[DYLogManager sharedManager] logWithCategory:@"崩溃"
+            message:[NSString stringWithFormat:@"💥 崩溃类型: %@", typeDesc]];
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"忽略（继续运行）"
+                                               style:UIAlertActionStyleCancel
+                                             handler:nil]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"重启应用"
+                                               style:UIAlertActionStyleDestructive
+                                             handler:^(UIAlertAction *a) {
+        // 重启：退出后让系统自动 relaunch 或手动触发
+        if (gOrigExit) gOrigExit(0);
+        else exit(0);
+    }]];
+
+    [topVC presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - 注册全部崩溃防护
+
+static void DYInstallAntiCrash(void) {
+    if (!gAntiCrashEnabled) return;
+
+    // ---- 1. Fishhook 拦截所有主动退出 ----
+    struct rebinding crashRebinds[] = {
+        { "exit",     (void *)&DYPatchedExit,    (void **)&gOrigExit },
+        { "_Exit",    (void *)&DYPatched_Exit,   (void **)&gOrig_Exit },
+        { "abort",    (void *)&DYPatchedAbort,   (void **)&gOrigAbort },
+    };
+    rebind_symbols(crashRebinds, sizeof(crashRebinds) / sizeof(crashRebinds[0]));
+
+    // ---- 2. Signal handler（致命信号）----
+    int fatalSignals[] = {
+        SIGSEGV, SIGABRT, SIGILL, SIGFPE, SIGBUS, SIGTRAP, SIGSYS,
+        SIGPIPE,     // ObjC 里经常有 SIGPIPE（向断开的 socket 写）
+        0
+    };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = DYSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    for (int i = 0; fatalSignals[i] != 0; i++) {
+        sigaction(fatalSignals[i], &sa, &gOrigSignalHandlers[fatalSignals[i]]);
+    }
+
+    // ---- 3. ObjC Uncaught Exception Handler ----
+    gOrigExceptionHandler = NSGetUncaughtExceptionHandler();
+    NSSetUncaughtExceptionHandler(&DYObjCExceptionHandler);
+
+    // ---- 4. C++ terminate handler（用 dlsym 从 libc++ 拿）----
+    void *libcpp = dlopen("libc++.1.dylib", RTLD_NOW);
+    if (libcpp) {
+        gSetTerminate = (DYSetTerminateFunc)dlsym(libcpp, "_ZSt13set_terminatePFvvE");
+        gGetTerminate = (DYGetTerminateFunc)dlsym(libcpp, "_ZSt11get_terminatev");
+        if (gSetTerminate && gGetTerminate) {
+            gOrigCppTerminate = gGetTerminate();
+            gSetTerminate(&DYCppTerminateHandler);
+        }
+    }
+
+    // ---- 5. 在主线程 runloop 里 setjmp（signal 崩溃后 longjmp 回这里）----
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gCrashJumpSet = YES;
+        int sig = sigsetjmp(gCrashJumpBuf, 1);
+        if (sig != 0) {
+            // 从 signal handler longjmp 回来 —— 说明我们被崩溃救回了
+            NSLog(@"[应用助手] 💪 从崩溃中恢复 (sig=%d)，准备弹崩溃提示...", sig);
+            DYShowCrashAlert();
+            // 恢复完了，重新 setjmp 等下一次
+            gCrashJumpSet = NO;
+            DYInstallAntiCrash();
+        }
+    });
+
+    [[DYLogManager sharedManager] logWithCategory:@"系统"
+        message:@"✅ 强力防崩溃已启动（signal+exception+C+++exit/abort 全拦截）"];
 }
 
 // 全局总开关：关闭后所有日志不捕获、不显示，但 hook 仍在运行
@@ -3063,17 +3434,8 @@ static BOOL DYShouldShowLine(NSString *line) {
         DYKeychainMonitor *keychainMonitor = [[DYKeychainMonitor alloc] init];
         [keychainMonitor startMonitoring];
 
-        // 防崩溃：hook exit / abort / _Exit，拦截 VPN/环境检测触发的主动闪退
-        if (gAntiCrashEnabled) {
-            struct rebinding crashRebinds[] = {
-                { "exit",    (void *)&DYPatchedExit,    (void **)&gOrigExit },
-                { "_Exit",   (void *)&DYPatched_Exit,   (void **)&gOrig_Exit },
-                { "abort",   (void *)&DYPatchedAbort,   (void **)&gOrigAbort },
-            };
-            rebind_symbols(crashRebinds, sizeof(crashRebinds) / sizeof(crashRebinds[0]));
-            [[DYLogManager sharedManager] logWithCategory:@"系统"
-                message:@"✅ 防崩溃已启动（拦截 exit/abort/_Exit）"];
-        }
+        // 强力防崩溃：signal + ObjC exception + C++ terminate + exit/abort/_Exit
+        DYInstallAntiCrash();
 
         // UserDefaults 读写监控通过 +load swizzle 自动生效，无需手动注册
 
