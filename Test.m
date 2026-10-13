@@ -468,6 +468,21 @@ static void DYInstallAntiCrash(void) {
 // 全局总开关：关闭后所有日志不捕获、不显示，但 hook 仍在运行
 static BOOL gGlobalLogEnabled = YES;
 
+// 外部代理配置（NSUserDefaults 持久化）
+static BOOL        gProxyEnabled = NO;
+static NSString    *gProxyHost = nil;
+static NSInteger   gProxyPort = 0;
+static BOOL        gProxyAuthEnabled = NO;
+static NSString    *gProxyUsername = nil;
+static NSString    *gProxyPassword = nil;
+
+static NSString *gProxyUDFHost(void)     { return [[NSUserDefaults standardUserDefaults] stringForKey:@"DYProxyHost"] ?: @""; }
+static NSInteger gProxyUDFPort(void)     { return [[NSUserDefaults standardUserDefaults] integerForKey:@"DYProxyPort"]; }
+static BOOL      gProxyUDFEnabled(void)  { return [[NSUserDefaults standardUserDefaults] boolForKey:@"DYProxyEnabled"]; }
+static BOOL      gProxyUDFAuth(void)     { return [[NSUserDefaults standardUserDefaults] boolForKey:@"DYProxyAuthEnabled"]; }
+static NSString *gProxyUDFUser(void)     { return [[NSUserDefaults standardUserDefaults] stringForKey:@"DYProxyUser"] ?: @""; }
+static NSString *gProxyUDFPass(void)     { return [[NSUserDefaults standardUserDefaults] stringForKey:@"DYProxyPass"] ?: @""; }
+
 // 日志行数上限（用户自定义，默认 3000，持久化到 NSUserDefaults）
 static NSInteger gMaxLogLines = -1;
 static NSInteger DYGetMaxLogLines(void) {
@@ -2165,6 +2180,242 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 @end
 
 // ============================================================================
+#pragma mark - 外部代理设置页
+// ============================================================================
+@interface DYProxySettingsViewController : UITableViewController <UITextFieldDelegate>
+@end
+
+@implementation DYProxySettingsViewController
+
+- (instancetype)init {
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (self) {
+        self.title = @"外部代理";
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
+        initWithTitle:@"保存" style:UIBarButtonItemStyleDone target:self action:@selector(save)];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    switch (section) {
+        case 0: return 3; // 启用 / 主机 / 端口
+        case 1: return 3; // 认证开关 / 用户名 / 密码
+        case 2: return 1; // 保存按钮
+        default: return 0;
+    }
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    switch (section) {
+        case 0: return @"代理服务器（必填）";
+        case 1: return @"代理认证（可选）";
+        case 2: return nil;
+        default: return nil;
+    }
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSInteger s = indexPath.section;
+    NSInteger r = indexPath.row;
+
+    if (s == 0) {
+        if (r == 0) {
+            static NSString *enId = @"DYProxyEnableCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:enId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:enId];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UISwitch *sw = [[UISwitch alloc] init];
+                sw.on = gProxyUDFEnabled();
+                [sw addTarget:self action:@selector(toggleEnabled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
+            cell.textLabel.text = @"启用外部代理";
+            ((UISwitch *)cell.accessoryView).on = gProxyUDFEnabled();
+            return cell;
+        } else if (r == 1) {
+            static NSString *hId = @"DYProxyHostCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:hId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:hId];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 180, 30)];
+                tf.placeholder = @"例如 127.0.0.1";
+                tf.text = gProxyUDFHost();
+                tf.clearButtonMode = UITextFieldViewModeAlways;
+                tf.textAlignment = NSTextAlignmentRight;
+                tf.tag = 1001;
+                cell.accessoryView = tf;
+            }
+            cell.textLabel.text = @"代理主机";
+            ((UITextField *)cell.accessoryView).text = gProxyUDFHost();
+            return cell;
+        } else {
+            static NSString *pId = @"DYProxyPortCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:pId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:pId];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 180, 30)];
+                tf.placeholder = @"例如 8080";
+                tf.text = gProxyUDFPort() > 0 ? [NSString stringWithFormat:@"%ld", (long)gProxyUDFPort()] : @"";
+                tf.keyboardType = UIKeyboardTypeNumberPad;
+                tf.clearButtonMode = UITextFieldViewModeAlways;
+                tf.textAlignment = NSTextAlignmentRight;
+                tf.tag = 1002;
+                cell.accessoryView = tf;
+            }
+            cell.textLabel.text = @"代理端口";
+            ((UITextField *)cell.accessoryView).text = gProxyUDFPort() > 0 ? [NSString stringWithFormat:@"%ld", (long)gProxyUDFPort()] : @"";
+            return cell;
+        }
+    } else if (s == 1) {
+        if (r == 0) {
+            static NSString *aId = @"DYProxyAuthCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:aId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:aId];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UISwitch *sw = [[UISwitch alloc] init];
+                sw.on = gProxyUDFAuth();
+                [sw addTarget:self action:@selector(toggleAuth:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
+            cell.textLabel.text = @"启用代理认证";
+            ((UISwitch *)cell.accessoryView).on = gProxyUDFAuth();
+            return cell;
+        } else if (r == 1) {
+            static NSString *uId = @"DYProxyUserCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:uId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:uId];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 180, 30)];
+                tf.placeholder = @"用户名";
+                tf.text = gProxyUDFUser();
+                tf.clearButtonMode = UITextFieldViewModeAlways;
+                tf.textAlignment = NSTextAlignmentRight;
+                tf.tag = 1003;
+                cell.accessoryView = tf;
+            }
+            cell.textLabel.text = @"用户名";
+            ((UITextField *)cell.accessoryView).text = gProxyUDFUser();
+            return cell;
+        } else {
+            static NSString *passId = @"DYProxyPassCell";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:passId];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:passId];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 180, 30)];
+                tf.placeholder = @"密码";
+                tf.text = gProxyUDFPass();
+                tf.secureTextEntry = YES;
+                tf.clearButtonMode = UITextFieldViewModeAlways;
+                tf.textAlignment = NSTextAlignmentRight;
+                tf.tag = 1004;
+                cell.accessoryView = tf;
+            }
+            cell.textLabel.text = @"密码";
+            ((UITextField *)cell.accessoryView).text = gProxyUDFPass();
+            return cell;
+        }
+    } else {
+        static NSString *saveId = @"DYProxySaveCell";
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:saveId];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:saveId];
+            cell.textLabel.text = @"保存并立即应用";
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            cell.textLabel.textAlignment = NSTextAlignmentCenter;
+        }
+        return cell;
+    }
+}
+
+- (void)toggleEnabled:(UISwitch *)sw {
+    [[NSUserDefaults standardUserDefaults] setBool:sw.isOn forKey:@"DYProxyEnabled"];
+}
+- (void)toggleAuth:(UISwitch *)sw {
+    [[NSUserDefaults standardUserDefaults] setBool:sw.isOn forKey:@"DYProxyAuthEnabled"];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 2) {
+        [self save];
+    }
+}
+
+- (void)save {
+    // 从 cell 拿当前值
+    NSString *host = @"";
+    NSInteger port = 0;
+    NSString *user = @"";
+    NSString *pass = @"";
+
+    for (UITableViewCell *cell in self.tableView.visibleCells) {
+        id acc = cell.accessoryView;
+        if ([acc isKindOfClass:[UITextField class]]) {
+            UITextField *tf = (UITextField *)acc;
+            if (tf.tag == 1001) host = tf.text;
+            else if (tf.tag == 1002) port = tf.text.integerValue;
+            else if (tf.tag == 1003) user = tf.text;
+            else if (tf.tag == 1004) pass = tf.text;
+        }
+    }
+
+    BOOL enabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"DYProxyEnabled"];
+
+    // 校验：启用时 host+port 必填
+    if (enabled && (host.length == 0 || port <= 0)) {
+        UIAlertController *tip = [UIAlertController
+            alertControllerWithTitle:@"配置不完整"
+            message:@"启用外部代理时，代理主机和端口必须填写。"
+            preferredStyle:UIAlertControllerStyleAlert];
+        [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:tip animated:YES completion:nil];
+        return;
+    }
+
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:host forKey:@"DYProxyHost"];
+    [ud setInteger:port forKey:@"DYProxyPort"];
+    [ud setObject:user forKey:@"DYProxyUser"];
+    [ud setObject:pass forKey:@"DYProxyPass"];
+
+    // 立即应用
+    DYReloadExternalProxy();
+
+    id mgr = [NSClassFromString(@"DYLogManager") performSelector:@selector(sharedManager)];
+    if (mgr) {
+        NSString *msg = enabled
+            ? [NSString stringWithFormat:@"🌐 外部代理已启用: %@:%ld%@", host.length ? host : @"(空)", (long)port,
+               gProxyUDFAuth() ? [NSString stringWithFormat:@" (auth: %@)", user] : @""]
+            : @"🌐 外部代理已关闭";
+        [mgr performSelector:@selector(logWithCategory:message:) withObject:@"系统" withObject:msg];
+    }
+
+    UIAlertController *tip = [UIAlertController
+        alertControllerWithTitle:@"已保存"
+        message:enabled ? [NSString stringWithFormat:@"外部代理已应用：%@:%ld", host, (long)port] : @"外部代理已关闭"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self.navigationController popViewControllerAnimated:YES];
+    }]];
+    [self presentViewController:tip animated:YES completion:nil];
+}
+
+@end
+
+// ============================================================================
 #pragma mark - 自定义 Hook 管理页（全屏，iOS Settings 原生风格）
 // ============================================================================
 @interface DYCustomHookViewController : UITableViewController
@@ -2342,7 +2593,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
 
 #pragma mark - Table view data source
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 4; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 5; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
@@ -2350,6 +2601,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         case 1: return 2; // Keychain / UserDefaults
         case 2: return 2; // 日志限制 / 关于应用
         case 3: return 1; // 自定义 Hook 入口
+        case 4: return 1; // 外部代理
         default: return 0;
     }
 }
@@ -2360,6 +2612,7 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         case 1: return @"额外监控";
         case 2: return @"其他";
         case 3: return @"高级";
+        case 4: return @"网络";
         default: return nil;
     }
 }
@@ -2406,6 +2659,23 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         NSUInteger count = DYCustomHookManager.sharedManager.rules.count;
         cell.textLabel.text = @"自定义 Hook";
         cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu 条规则", (unsigned long)count];
+        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+        return cell;
+    }
+    // section 4: 外部代理配置入口
+    if (s == 4) {
+        static NSString *proxyId = @"DYProxyEntryCell";
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:proxyId];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:proxyId];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        }
+        NSString *host = gProxyUDFHost();
+        NSInteger port = gProxyUDFPort();
+        NSString *sub = gProxyUDFEnabled() ? [NSString stringWithFormat:@"%@:%ld", host.length ? host : @"未配置", (long)port] : @"已关闭";
+        cell.textLabel.text = @"外部代理";
+        cell.detailTextLabel.text = sub;
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
         return cell;
     }
@@ -2506,6 +2776,9 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
         [self showAboutSheet];
     } else if (indexPath.section == 3 && indexPath.row == 0) {
         DYCustomHookViewController *vc = [[DYCustomHookViewController alloc] init];
+        [self.navigationController pushViewController:vc animated:YES];
+    } else if (indexPath.section == 4 && indexPath.row == 0) {
+        DYProxySettingsViewController *vc = [[DYProxySettingsViewController alloc] init];
         [self.navigationController pushViewController:vc animated:YES];
     }
 }
@@ -3333,6 +3606,9 @@ static BOOL DYShouldShowLine(NSString *line) {
         // 强力防崩溃：signal + ObjC exception + C++ terminate + exit/abort/_Exit
         DYInstallAntiCrash();
 
+        // 外部代理（用户配置 proxy host+port+可选认证）
+        DYRegisterExternalProxy();
+
         // UserDefaults 读写监控通过 +load swizzle 自动生效，无需手动注册
 
         // 加载持久化的自定义 Hook 规则（plist）并应用
@@ -3450,6 +3726,221 @@ static BOOL DYShouldShowLine(NSString *line) {
 }
 
 @end
+
+// ----------------------------------------------------------------------------
+// DYProxyURLProtocol —— 拦截 App 内所有 HTTP/HTTPS 请求，日志记录 + 强制走用户配置代理
+// ----------------------------------------------------------------------------
+@interface DYProxyURLProtocol : NSURLProtocol <NSURLSessionDelegate, NSURLSessionTaskDelegate, NSURLSessionDataDelegate> {
+    NSURLSession *_proxySession;
+    NSURLSessionDataTask *_currentTask;
+    NSMutableData *_responseData;
+    NSDate *_startTime;
+    NSUInteger _reqBodyLen;
+    NSUInteger _respBodyLen;
+}
+@end
+
+@implementation DYProxyURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if (!gProxyEnabled) return NO;
+    NSString *scheme = request.URL.scheme.lowercaseString;
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+    // 只拦截 App 自己的请求（不递归拦截我们自己的 proxySession）
+    if ([NSURLProtocol propertyForKey:@"DYProxyHandled" inRequest:request]) return NO;
+    return YES;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
++ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
+    return [a isEqual:b];
+}
+
+- (void)startLoading {
+    // 标记：我们处理过了，防止递归
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"DYProxyHandled" inRequest:req];
+
+    // 构建 proxySession 配置（每次 startLoading 都根据当前 gProxy* 动态重建，
+    // 保证用户改了设置后下次请求立即生效）
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    config.connectionProxyDictionary = @{
+        (__bridge NSString *)kCFNetworkProxiesHTTPEnable  : @YES,
+        (__bridge NSString *)kCFNetworkProxiesHTTPProxy   : gProxyHost ?: @"",
+        (__bridge NSString *)kCFNetworkProxiesHTTPPort    : @(gProxyPort),
+        (__bridge NSString *)kCFNetworkProxiesHTTPSEnable : @YES,
+        (__bridge NSString *)kCFNetworkProxiesHTTPSProxy  : gProxyHost ?: @"",
+        (__bridge NSString *)kCFNetworkProxiesHTTPSPort   : @(gProxyPort),
+    };
+    if (gProxyAuthEnabled && gProxyUsername.length > 0) {
+        // proxy CONNECT 隧道认证放在 URL 的 user:pass@host 里
+        NSString *authStr = [NSString stringWithFormat:@"%@:%@", gProxyUsername ?: @"", gProxyPassword ?: @""];
+        NSString *b64 = [[authStr dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+        [req setValue:[NSString stringWithFormat:@"Basic %@", b64] forHTTPHeaderField:@"Proxy-Authorization"];
+    }
+    _proxySession = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+    _responseData = [NSMutableData data];
+    _startTime = [NSDate date];
+    _reqBodyLen = req.HTTPBody.length;
+    _respBodyLen = 0;
+
+    // 构建请求日志（启动时就打，用户改了开关也能看到"正在请求"）
+    NSString *cat = @"外部代理";
+    NSMutableString *info = [NSMutableString stringWithFormat:
+        @"🚀 请求 | %@ %@ | 代理=%@:%ld",
+        req.HTTPMethod ?: @"GET",
+        req.URL.absoluteString ?: @"(nil)",
+        gProxyHost ?: @"(无)",
+        (long)gProxyPort];
+    if (_reqBodyLen > 0) {
+        NSString *bodyStr = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding] ?:
+                            [NSString stringWithFormat:@"<二进制 %lu 字节>", (unsigned long)_reqBodyLen];
+        if (bodyStr.length > 500) bodyStr = [[bodyStr substringToIndex:500] stringByAppendingString:@"...(截断)"];
+        [info appendFormat:@"\n请求体: %@", bodyStr];
+    }
+    NSMutableArray *hdrs = [NSMutableArray array];
+    [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        [hdrs addObject:[NSString stringWithFormat:@"%@=%@", k, v]];
+    }];
+    if (hdrs.count > 0) {
+        [info appendFormat:@"\n请求头: %@", [hdrs componentsJoinedByString:@", "]];
+    }
+    id mgr = [NSClassFromString(@"DYLogManager") performSelector:@selector(sharedManager)];
+    if (mgr && gGlobalLogEnabled) {
+        [mgr performSelector:@selector(logWithCategory:message:) withObject:cat withObject:info];
+    }
+
+    // 发起请求（走用户代理）
+    _currentTask = [_proxySession dataTaskWithRequest:req];
+    [_currentTask resume];
+}
+
+- (void)stopLoading {
+    [_currentTask cancel];
+    _currentTask = nil;
+}
+
+#pragma mark - NSURLSession delegate
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    if (completionHandler) completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveData:(NSData *)data {
+    [_responseData appendData:data];
+    _respBodyLen += data.length;
+    [self.client URLProtocol:self didLoadData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+didCompleteWithError:(NSError *)error {
+    NSTimeInterval dt = -[_startTime timeIntervalSinceNow];
+    if (error) {
+        [self.client URLProtocol:self didFailWithError:error];
+    } else {
+        [self.client URLProtocolDidFinishLoading:self];
+    }
+
+    // 响应日志
+    NSMutableString *respInfo = [NSMutableString stringWithFormat:
+        @"📥 响应 | %@ | 耗时 %.1fms | body %lu B",
+        dataTask.response.URL.absoluteString ?: @"(nil)",
+        dt * 1000,
+        (unsigned long)_respBodyLen];
+
+    NSHTTPURLResponse *http = (NSHTTPURLResponse *)dataTask.response;
+    if ([http isKindOfClass:[NSHTTPURLResponse class]]) {
+        [respInfo appendFormat:@" | status=%ld", (long)http.statusCode];
+        if (http.allHeaderFields.count > 0) {
+            NSMutableArray *hdrs = [NSMutableArray array];
+            [http.allHeaderFields enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *s) {
+                [hdrs addObject:[NSString stringWithFormat:@"%@=%@", k, v]];
+            }];
+            [respInfo appendFormat:@"\n响应头: %@", [hdrs componentsJoinedByString:@", "]];
+        }
+    }
+    if (!error && _respBodyLen > 0 && _respBodyLen <= 2048) {
+        // body ≤ 2KB 直接展示；更大就截
+        if ([http isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSString *ctype = http.allHeaderFields[@"Content-Type"] ?: @"";
+            if ([ctype containsString:@"text"] || [ctype containsString:@"json"] || [ctype containsString:@"xml"]) {
+                NSString *body = [[NSString alloc] initWithData:_responseData encoding:NSUTF8StringEncoding]
+                                 ?: [[NSString alloc] initWithData:_responseData encoding:NSASCIIStringEncoding]
+                                 ?: @"(无法解码)";
+                [respInfo appendFormat:@"\n响应体: %@", body.length > 1000 ? [[body substringToIndex:1000] stringByAppendingString:@"...(截断)"] : body];
+            }
+        }
+    } else if (!error && _respBodyLen > 2048) {
+        [respInfo appendFormat:@"\n响应体: (二进制 %lu B，跳过直接展示)", (unsigned long)_respBodyLen];
+    }
+    if (error) {
+        [respInfo appendFormat:@"\n❌ 错误: %@ (domain=%@ code=%ld)",
+         error.localizedDescription, error.domain ?: @"", (long)error.code];
+    }
+
+    id mgr = [NSClassFromString(@"DYLogManager") performSelector:@selector(sharedManager)];
+    if (mgr && gGlobalLogEnabled) {
+        [mgr performSelector:@selector(logWithCategory:message:)
+                    withObject:@"外部代理"
+                    withObject:respInfo];
+    }
+
+    // 清理
+    _currentTask = nil;
+    _responseData = nil;
+    [_proxySession invalidateAndCancel];
+    _proxySession = nil;
+}
+
+@end
+
+// ----------------------------------------------------------------------------
+// 注册外部代理
+// ----------------------------------------------------------------------------
+static void DYRegisterExternalProxy(void) {
+    // 从 NSUserDefaults 读取配置到全局
+    gProxyHost = gProxyUDFHost();
+    gProxyPort = gProxyUDFPort();
+    gProxyEnabled = gProxyUDFEnabled();
+    gProxyAuthEnabled = gProxyUDFAuth();
+    gProxyUsername = gProxyUDFUser();
+    gProxyPassword = gProxyUDFPass();
+
+    if (gProxyEnabled && gProxyHost.length > 0 && gProxyPort > 0) {
+        // 注册自定义 NSURLProtocol，让所有 URLSession 请求被我们拦截
+        [NSURLProtocol registerClass:[DYProxyURLProtocol class]];
+        NSLog(@"[应用助手] 🌐 外部代理已启用: http://%@:%ld", gProxyHost, (long)gProxyPort);
+        if (gProxyAuthEnabled) {
+            NSLog(@"[应用助手] 🔐 代理认证: %@", gProxyUsername);
+        }
+    } else {
+        NSLog(@"[应用助手] 🌐 外部代理未启用");
+    }
+}
+
+// 重新加载代理配置（设置页保存后调）
+static void DYReloadExternalProxy(void) {
+    // 先取消注册旧的
+    [NSURLProtocol unregisterClass:[DYProxyURLProtocol class]];
+    // 重新读配置 + 注册
+    gProxyHost = gProxyUDFHost();
+    gProxyPort = gProxyUDFPort();
+    gProxyEnabled = gProxyUDFEnabled();
+    gProxyAuthEnabled = gProxyUDFAuth();
+    gProxyUsername = gProxyUDFUser();
+    gProxyPassword = gProxyUDFPass();
+    if (gProxyEnabled && gProxyHost.length > 0 && gProxyPort > 0) {
+        [NSURLProtocol registerClass:[DYProxyURLProtocol class]];
+        NSLog(@"[应用助手] 🌐 外部代理已更新: http://%@:%ld", gProxyHost, (long)gProxyPort);
+    }
+}
 
 // ============================================================================
 #pragma mark - dylib 入口（constructor）
