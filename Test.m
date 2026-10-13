@@ -186,6 +186,8 @@ static BOOL gAntiCrashEnabled = YES;
 
 // 前向声明
 static void DYInstallAntiCrash(void);
+static void DYRegisterExternalProxy(void);
+static void DYReloadExternalProxy(void);
 
 // 原始 C 函数指针（fishhook 会填）
 static void (*gOrigExit)(int) = NULL;
@@ -3771,9 +3773,10 @@ static BOOL DYShouldShowLine(NSString *line) {
         (__bridge NSString *)kCFNetworkProxiesHTTPEnable  : @YES,
         (__bridge NSString *)kCFNetworkProxiesHTTPProxy   : gProxyHost ?: @"",
         (__bridge NSString *)kCFNetworkProxiesHTTPPort    : @(gProxyPort),
-        (__bridge NSString *)kCFNetworkProxiesHTTPSEnable : @YES,
-        (__bridge NSString *)kCFNetworkProxiesHTTPSProxy  : gProxyHost ?: @"",
-        (__bridge NSString *)kCFNetworkProxiesHTTPSPort   : @(gProxyPort),
+        // iOS SDK 没公开 HTTPS 代理常量，用字符串字面量（等价于 macOS 的 kCFNetworkProxiesHTTPS*）
+        @"HTTPSEnable" : @YES,
+        @"HTTPSProxy"  : gProxyHost ?: @"",
+        @"HTTPSPort"   : @(gProxyPort),
     };
     if (gProxyAuthEnabled && gProxyUsername.length > 0) {
         // proxy CONNECT 隧道认证放在 URL 的 user:pass@host 里
