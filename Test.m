@@ -2586,6 +2586,12 @@ static BOOL DYSwizzleObjCMethod(NSString *clsName, NSString *selName, BOOL isCla
                                                                             action:@selector(handleDone)];
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // 从子页面（外部代理 / Hook 管理）返回时刷新状态
+    [self.tableView reloadData];
+}
+
 - (void)handleDone {
     __weak DYSettingsViewController *weakSelf = self;
     [self dismissViewControllerAnimated:YES completion:^{
@@ -3743,6 +3749,70 @@ static BOOL DYShouldShowLine(NSString *line) {
 @end
 
 @implementation DYProxyURLProtocol
+
+// 在 +load 里 swizzle NSURLSessionConfiguration 的两个工厂方法，
+// 强制把我们的 protocol 注入 protocolClasses —— 这是让所有 NSURLSession 请求都走我们的关键
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class cfgCls = [NSURLSessionConfiguration class];
+
+        SEL defaultSel = @selector(defaultSessionConfiguration);
+        SEL ephemeralSel = @selector(ephemeralSessionConfiguration);
+
+        Method m1 = class_getClassMethod(cfgCls, defaultSel);
+        Method m2 = class_getClassMethod(cfgCls, ephemeralSel);
+
+        IMP origDefault = method_getImplementation(m1);
+        IMP origEphemeral = method_getImplementation(m2);
+
+        // 用 block 生成新 IMP（签名必须匹配）
+        IMP newDefault = imp_implementationWithBlock(^NSURLSessionConfiguration *(id _self) {
+            NSURLSessionConfiguration *cfg = ((NSURLSessionConfiguration *(*)(id, SEL))origDefault)(_self, defaultSel);
+            // 注入我们的 protocol 到最前面（优先级最高）
+            NSMutableArray *protos = [NSMutableArray arrayWithArray:cfg.protocolClasses ?: @[]];
+            if (![protos containsObject:[DYProxyURLProtocol class]]) {
+                [protos insertObject:[DYProxyURLProtocol class] atIndex:0];
+                cfg.protocolClasses = protos;
+            }
+            // 同时设代理（兜底，万一 protocol 没生效）
+            if (gProxyEnabled && gProxyHost.length > 0 && gProxyPort > 0) {
+                cfg.connectionProxyDictionary = @{
+                    (__bridge NSString *)kCFNetworkProxiesHTTPEnable : @YES,
+                    (__bridge NSString *)kCFNetworkProxiesHTTPProxy  : gProxyHost,
+                    (__bridge NSString *)kCFNetworkProxiesHTTPPort   : @(gProxyPort),
+                    @"HTTPSEnable" : @YES,
+                    @"HTTPSProxy"  : gProxyHost,
+                    @"HTTPSPort"   : @(gProxyPort),
+                };
+            }
+            return cfg;
+        });
+
+        IMP newEphemeral = imp_implementationWithBlock(^NSURLSessionConfiguration *(id _self) {
+            NSURLSessionConfiguration *cfg = ((NSURLSessionConfiguration *(*)(id, SEL))origEphemeral)(_self, ephemeralSel);
+            NSMutableArray *protos = [NSMutableArray arrayWithArray:cfg.protocolClasses ?: @[]];
+            if (![protos containsObject:[DYProxyURLProtocol class]]) {
+                [protos insertObject:[DYProxyURLProtocol class] atIndex:0];
+                cfg.protocolClasses = protos;
+            }
+            if (gProxyEnabled && gProxyHost.length > 0 && gProxyPort > 0) {
+                cfg.connectionProxyDictionary = @{
+                    (__bridge NSString *)kCFNetworkProxiesHTTPEnable : @YES,
+                    (__bridge NSString *)kCFNetworkProxiesHTTPProxy  : gProxyHost,
+                    (__bridge NSString *)kCFNetworkProxiesHTTPPort   : @(gProxyPort),
+                    @"HTTPSEnable" : @YES,
+                    @"HTTPSProxy"  : gProxyHost,
+                    @"HTTPSPort"   : @(gProxyPort),
+                };
+            }
+            return cfg;
+        });
+
+        method_setImplementation(m1, newDefault);
+        method_setImplementation(m2, newEphemeral);
+    });
+}
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     if (!gProxyEnabled) return NO;
